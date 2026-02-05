@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
@@ -42,6 +43,17 @@ const STAFF_SALARY_SHEET = 'Staff salary';
 // Attendance sheet
 const ATTENDANCE_SHEET_ID = process.env.ATTENDANCE_SHEET_ID || '1NjZxG_LctqXZP2nk1HvXbFG4rVVzeK6H4WZ-4iRtODE';
 const LABOUR_ATTENDANCE_SHEET = 'Labour attendence';
+
+// Convert 1-based column number to letter(s): 1=A, 26=Z, 27=AA, 34=AH
+function getColumnLetter(colNum) {
+  let letter = '';
+  while (colNum > 0) {
+    const mod = (colNum - 1) % 26;
+    letter = String.fromCharCode(65 + mod) + letter;
+    colNum = Math.floor((colNum - 1) / 26);
+  }
+  return letter;
+}
 
 // Build voucher position map
 const buildVoucherPositionMap = () => {
@@ -803,7 +815,7 @@ app.get('/api/attendance', async (req, res) => {
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: ATTENDANCE_SHEET_ID,
-      range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AF`, // Columns A to AF (31 days + employee info)
+      range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AH`, // Columns A to AH (3 info cols + 31 days)
     });
 
     const rows = response.data.values || [];
@@ -876,8 +888,8 @@ app.put('/api/attendance/:employeeId/:day', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Employee not found in attendance sheet' });
     }
 
-    // Column for the day (Day 1 = Column D = index 4 in A1 notation)
-    const colLetter = String.fromCharCode(67 + dayNum); // C=67, so day 1 = D
+    // Column for the day (Day 1 = Column D = 4th column, Day 31 = Column AH = 34th column)
+    const colLetter = getColumnLetter(dayNum + 3);
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: ATTENDANCE_SHEET_ID,
@@ -919,8 +931,8 @@ app.post('/api/attendance/bulk', async (req, res) => {
       }
     }
 
-    // Column for the day
-    const colLetter = String.fromCharCode(67 + dayNum);
+    // Column for the day (Day 1 = Column D = 4th column, Day 31 = Column AH = 34th column)
+    const colLetter = getColumnLetter(dayNum + 3);
 
     // Prepare batch update
     const batchData = [];
