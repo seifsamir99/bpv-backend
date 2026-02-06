@@ -959,6 +959,206 @@ app.post('/api/employees/:id/move', async (req, res) => {
   }
 });
 
+// Validate data consistency between salary and attendance sheets
+app.get('/api/employees/validation', async (req, res) => {
+  try {
+    const sheets = await getSheets();
+    const issues = [];
+
+    // Get all employees from salary sheets
+    const salaryEmployees = new Map();
+
+    const labourSalaryRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${LABOUR_SALARY_SHEET}'!A:C`,
+    });
+    (labourSalaryRes.data.values || []).slice(1).forEach(row => {
+      if (row[0]) salaryEmployees.set(row[0], { name: row[1], type: 'labour', inSalary: true });
+    });
+
+    const staffSalaryRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${STAFF_SALARY_SHEET}'!A:C`,
+    });
+    (staffSalaryRes.data.values || []).slice(1).forEach(row => {
+      if (row[0]) salaryEmployees.set(row[0], { name: row[1], type: 'staff', inSalary: true });
+    });
+
+    // Get all employees from attendance sheets
+    const attendanceEmployees = new Map();
+
+    const labourAttRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: ATTENDANCE_SHEET_ID,
+      range: `'${LABOUR_ATTENDANCE_SHEET}'!A:C`,
+    });
+    (labourAttRes.data.values || []).slice(1).forEach(row => {
+      if (row[0]) attendanceEmployees.set(row[0], { name: row[1], designation: row[2], type: 'labour', inAttendance: true });
+    });
+
+    const staffAttRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: ATTENDANCE_SHEET_ID,
+      range: `'${STAFF_ATTENDANCE_SHEET}'!A:C`,
+    });
+    (staffAttRes.data.values || []).slice(1).forEach(row => {
+      if (row[0]) attendanceEmployees.set(row[0], { name: row[1], designation: row[2], type: 'staff', inAttendance: true });
+    });
+
+    // Find inconsistencies
+    // 1. In attendance but not in salary
+    attendanceEmployees.forEach((attData, id) => {
+      if (!salaryEmployees.has(id)) {
+        issues.push({
+          type: 'missing_salary',
+          employeeId: id,
+          name: attData.name,
+          designation: attData.designation,
+          attendanceType: attData.type,
+          message: `Employee ${attData.name} (ID: ${id}) exists in ${attData.type} attendance but not in salary sheet`
+        });
+      }
+    });
+
+    // 2. In salary but not in attendance
+    salaryEmployees.forEach((salData, id) => {
+      if (!attendanceEmployees.has(id)) {
+        issues.push({
+          type: 'missing_attendance',
+          employeeId: id,
+          name: salData.name,
+          salaryType: salData.type,
+          message: `Employee ${salData.name} (ID: ${id}) exists in ${salData.type} salary but not in attendance sheet`
+        });
+      }
+    });
+
+    // 3. Type mismatch (in both but different types)
+    attendanceEmployees.forEach((attData, id) => {
+      const salData = salaryEmployees.get(id);
+      if (salData && attData.type !== salData.type) {
+        issues.push({
+          type: 'type_mismatch',
+          employeeId: id,
+          name: attData.name,
+          attendanceType: attData.type,
+          salaryType: salData.type,
+          message: `Employee ${attData.name} (ID: ${id}) is ${attData.type} in attendance but ${salData.type} in salary`
+        });
+      }
+    });
+
+    res.json({
+      success: true,
+      totalIssues: issues.length,
+      issues
+    });
+  } catch (error) {
+    console.error('Error validating employees:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Fix missing salary record - create from attendance data
+app.post('/api/employees/:id/fix-missing', async (req, res) => {
+  try {
+    const employeeId = req.params.id;
+    const { targetType, ratePerDay, ratePerHour, otHours } = req.body;
+
+    if (!targetType || !['labour', 'staff'].includes(targetType)) {
+      return res.status(400).json({ success: false, error: 'targetType must be "labour" or "staff"' });
+    }
+
+    const sheets = await getSheets();
+
+    // 1. Get employee data from attendance
+    const attSheet = targetType === 'labour' ? LABOUR_ATTENDANCE_SHEET : STAFF_ATTENDANCE_SHEET;
+    const attRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: ATTENDANCE_SHEET_ID,
+      range: `'${attSheet}'!A:C`,
+    });
+    const attRows = attRes.data.values || [];
+
+    let employeeData = null;
+    for (let i = 1; i < attRows.length; i++) {
+      if (attRows[i][0] === employeeId) {
+        employeeData = {
+          id: attRows[i][0],
+          name: attRows[i][1],
+          designation: attRows[i][2] || ''
+        };
+        break;
+      }
+    }
+
+    if (!employeeData) {
+      return res.status(404).json({ success: false, error: `Employee ${employeeId} not found in ${attSheet}` });
+    }
+
+    // 2. Check if already exists in salary
+    const salSheet = targetType === 'labour' ? LABOUR_SALARY_SHEET : STAFF_SALARY_SHEET;
+    const salRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${salSheet}'!A:A`,
+    });
+    const salRows = salRes.data.values || [];
+
+    for (let i = 1; i < salRows.length; i++) {
+      if (salRows[i][0] === employeeId) {
+        return res.status(400).json({ success: false, error: `Employee ${employeeId} already exists in ${salSheet}` });
+      }
+    }
+
+    // 3. Add to salary sheet
+    const nextRow = salRows.length + 1;
+    let rowData;
+
+    if (targetType === 'labour') {
+      // Labour: ID, Name, Designation, Rate/Day, Rate/Hour, OT Hours, Deduction, Net Salary
+      rowData = [
+        employeeData.id,
+        employeeData.name,
+        employeeData.designation,
+        ratePerDay || 0,
+        ratePerHour || 0,
+        otHours || 0,
+        0, // Deduction
+        0  // Net Salary (calculated elsewhere)
+      ];
+    } else {
+      // Staff: ID, Name, Designation, Rate/Day, Rate/Hour, Deduction, Net Salary
+      rowData = [
+        employeeData.id,
+        employeeData.name,
+        employeeData.designation,
+        ratePerDay || 0,
+        ratePerHour || 0,
+        0, // Deduction
+        0  // Net Salary
+      ];
+    }
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${salSheet}'!A${nextRow}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [rowData] }
+    });
+
+    res.json({
+      success: true,
+      message: `Created salary record for ${employeeData.name} (ID: ${employeeId}) in ${salSheet}`,
+      data: {
+        id: employeeData.id,
+        name: employeeData.name,
+        designation: employeeData.designation,
+        type: targetType
+      }
+    });
+  } catch (error) {
+    console.error('Error fixing missing employee:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================
 // ATTENDANCE API ENDPOINTS
 // ============================================
