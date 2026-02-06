@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
+const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 app.use(cors());
@@ -1494,6 +1495,145 @@ app.post('/api/employees/ot/bulk', async (req, res) => {
     res.json({ success: true, message: `Updated ${batchData.length} OT records` });
   } catch (error) {
     console.error('Error bulk updating OT:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// AI CHAT ENDPOINT
+// ============================================
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+app.post('/api/ai/chat', async (req, res) => {
+  try {
+    const { message, history } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ success: false, error: 'Message is required' });
+    }
+
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ success: false, error: 'AI service not configured' });
+    }
+
+    const sheets = await getSheets();
+
+    // Fetch current data for context
+    const [labourEmpRes, staffEmpRes, labourAttRes, staffAttRes] = await Promise.all([
+      sheets.spreadsheets.values.get({
+        spreadsheetId: SALARY_SHEET_ID,
+        range: `'${LABOUR_SALARY_SHEET}'!A:H`,
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId: SALARY_SHEET_ID,
+        range: `'${STAFF_SALARY_SHEET}'!A:G`,
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId: ATTENDANCE_SHEET_ID,
+        range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AH`,
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId: ATTENDANCE_SHEET_ID,
+        range: `'${STAFF_ATTENDANCE_SHEET}'!A:AH`,
+      }),
+    ]);
+
+    // Parse employees
+    const labourEmps = (labourEmpRes.data.values || []).slice(1).filter(r => r[0] && r[1]);
+    const staffEmps = (staffEmpRes.data.values || []).slice(1).filter(r => r[0] && r[1]);
+
+    // Parse attendance - count statuses
+    const parseAttendance = (rows) => {
+      const summary = [];
+      for (let i = 1; i < (rows || []).length; i++) {
+        const row = rows[i];
+        if (!row[0]) continue;
+        let present = 0, absent = 0, leave = 0, off = 0, sick = 0;
+        for (let d = 3; d <= 33; d++) {
+          const status = (row[d] || '').toLowerCase();
+          if (status === 'present') present++;
+          else if (status === 'absent') absent++;
+          else if (status === 'leave') leave++;
+          else if (status === 'off') off++;
+          else if (status === 'sick') sick++;
+        }
+        summary.push({ id: row[0], name: row[1], designation: row[2], present, absent, leave, off, sick });
+      }
+      return summary;
+    };
+
+    const labourAtt = parseAttendance(labourAttRes.data.values);
+    const staffAtt = parseAttendance(staffAttRes.data.values);
+
+    // Build context summary
+    const today = new Date();
+    const monthName = today.toLocaleString('default', { month: 'long', year: 'numeric' });
+
+    const context = `
+You are an HR Assistant for Newell Electromechanical Works LLC.
+
+CURRENT DATA (${monthName}):
+
+LABOUR EMPLOYEES (${labourEmps.length} total):
+${labourEmps.slice(0, 20).map(e => `- ID ${e[0]}: ${e[1]} (${e[2]}) - Rate/Day: ${e[3]} AED, OT Hours: ${e[5] || 0}`).join('\n')}
+${labourEmps.length > 20 ? `...and ${labourEmps.length - 20} more` : ''}
+
+STAFF EMPLOYEES (${staffEmps.length} total):
+${staffEmps.slice(0, 10).map(e => `- ID ${e[0]}: ${e[1]} (${e[2]}) - Rate/Day: ${e[3]} AED`).join('\n')}
+${staffEmps.length > 10 ? `...and ${staffEmps.length - 10} more` : ''}
+
+ATTENDANCE SUMMARY (This Month):
+Labour attendance:
+${labourAtt.slice(0, 15).map(a => `- ${a.name}: ${a.present} present, ${a.absent} absent, ${a.leave} leave`).join('\n')}
+${labourAtt.length > 15 ? `...and ${labourAtt.length - 15} more` : ''}
+
+Most absent Labour employees: ${labourAtt.sort((a,b) => b.absent - a.absent).slice(0,5).map(a => `${a.name} (${a.absent} days)`).join(', ')}
+
+Staff attendance:
+${staffAtt.slice(0, 10).map(a => `- ${a.name}: ${a.present} present, ${a.absent} absent, ${a.leave} leave`).join('\n')}
+
+TOTALS:
+- Total employees: ${labourEmps.length + staffEmps.length}
+- Labour: ${labourEmps.length}
+- Staff: ${staffEmps.length}
+
+Calculate payroll estimates using:
+- Net Salary = (Rate/Day * Paid Days) + (OT Hours * Rate/Hour * 1.25) for Labour
+- Paid Days = Present + Off days
+- OT Rate = Rate/Day / 8 * 1.25
+
+Be concise and helpful. Format numbers with commas (e.g., 50,000.00 AED).
+If asked about something not in the data, say you don't have that information.
+`;
+
+    // Build messages for Claude
+    const messages = [];
+
+    // Add history if provided
+    if (history && Array.isArray(history)) {
+      history.forEach(msg => {
+        if (msg.role === 'user' || msg.role === 'assistant') {
+          messages.push({ role: msg.role, content: msg.content });
+        }
+      });
+    }
+
+    // Add current message
+    messages.push({ role: 'user', content: message });
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      system: context,
+      messages: messages,
+    });
+
+    const assistantResponse = response.content[0]?.text || 'Sorry, I could not generate a response.';
+
+    res.json({ success: true, response: assistantResponse });
+  } catch (error) {
+    console.error('Error in AI chat:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
