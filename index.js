@@ -43,6 +43,7 @@ const STAFF_SALARY_SHEET = 'Staff salary';
 // Attendance sheet
 const ATTENDANCE_SHEET_ID = process.env.ATTENDANCE_SHEET_ID || '1NjZxG_LctqXZP2nk1HvXbFG4rVVzeK6H4WZ-4iRtODE';
 const LABOUR_ATTENDANCE_SHEET = 'Labour attendence';
+const STAFF_ATTENDANCE_SHEET = 'Staff attendence';
 
 // Convert 1-based column number to letter(s): 1=A, 26=Z, 27=AA, 34=AH
 function getColumnLetter(colNum) {
@@ -53,6 +54,16 @@ function getColumnLetter(colNum) {
     colNum = Math.floor((colNum - 1) / 26);
   }
   return letter;
+}
+
+// Normalize known attendance statuses to canonical casing
+const CANONICAL_STATUSES = {
+  present: 'Present', absent: 'Absent', leave: 'Leave',
+  off: 'Off', sick: 'Sick', joined: 'Joined', holiday: 'Holiday'
+};
+function normalizeStatus(status) {
+  if (!status) return status;
+  return CANONICAL_STATUSES[status.toLowerCase()] || status;
 }
 
 // Build voucher position map
@@ -808,45 +819,53 @@ app.delete('/api/employees/:id', async (req, res) => {
 // ATTENDANCE API ENDPOINTS
 // ============================================
 
-// Get attendance for a specific month
+// Get attendance - supports ?type=labour|staff|all (default: all)
 app.get('/api/attendance', async (req, res) => {
   try {
     const sheets = await getSheets();
-
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: ATTENDANCE_SHEET_ID,
-      range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AH`, // Columns A to AH (3 info cols + 31 days)
-    });
-
-    const rows = response.data.values || [];
-    if (rows.length === 0) {
-      return res.json({ success: true, data: [] });
-    }
-
-    const headers = rows[0];
+    const type = req.query.type || 'all';
     const attendance = [];
 
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!row[0]) continue; // Skip empty rows
-
-      const record = {
-        employeeId: row[0],
-        name: row[1],
-        designation: row[2],
-        rowIndex: i + 1,
-        days: {}
-      };
-
-      // Parse days 1-31 (columns D onwards, index 3+)
-      for (let day = 1; day <= 31; day++) {
-        const colIndex = day + 2; // Day 1 is at index 3
-        if (colIndex < row.length) {
-          record.days[day] = row[colIndex] || '';
+    const parseAttendanceRows = (rows, sheetType) => {
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row[0]) continue;
+        const record = {
+          employeeId: row[0],
+          name: row[1],
+          designation: row[2],
+          rowIndex: i + 1,
+          type: sheetType,
+          days: {}
+        };
+        for (let day = 1; day <= 31; day++) {
+          const colIndex = day + 2;
+          if (colIndex < row.length) {
+            record.days[day] = row[colIndex] || '';
+          }
         }
+        attendance.push(record);
       }
+    };
 
-      attendance.push(record);
+    if (type === 'labour' || type === 'all') {
+      const labourRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: ATTENDANCE_SHEET_ID,
+        range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AH`,
+      });
+      parseAttendanceRows(labourRes.data.values || [], 'labour');
+    }
+
+    if (type === 'staff' || type === 'all') {
+      try {
+        const staffRes = await sheets.spreadsheets.values.get({
+          spreadsheetId: ATTENDANCE_SHEET_ID,
+          range: `'${STAFF_ATTENDANCE_SHEET}'!A:AH`,
+        });
+        parseAttendanceRows(staffRes.data.values || [], 'staff');
+      } catch (staffErr) {
+        console.warn('Staff attendance sheet not found or error:', staffErr.message);
+      }
     }
 
     res.json({ success: true, data: attendance });
@@ -860,19 +879,20 @@ app.get('/api/attendance', async (req, res) => {
 app.put('/api/attendance/:employeeId/:day', async (req, res) => {
   try {
     const { employeeId, day } = req.params;
-    const { status } = req.body;
+    const { status, type } = req.body;
     const dayNum = parseInt(day);
 
     if (dayNum < 1 || dayNum > 31) {
       return res.status(400).json({ success: false, error: 'Invalid day' });
     }
 
+    const sheetName = type === 'staff' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
     const sheets = await getSheets();
 
     // Find the employee row
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: ATTENDANCE_SHEET_ID,
-      range: `'${LABOUR_ATTENDANCE_SHEET}'!A:A`,
+      range: `'${sheetName}'!A:A`,
     });
     const rows = response.data.values || [];
 
@@ -893,12 +913,12 @@ app.put('/api/attendance/:employeeId/:day', async (req, res) => {
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: ATTENDANCE_SHEET_ID,
-      range: `'${LABOUR_ATTENDANCE_SHEET}'!${colLetter}${targetRow}`,
-      valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [[status]] }
+      range: `'${sheetName}'!${colLetter}${targetRow}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[normalizeStatus(status)]] }
     });
 
-    res.json({ success: true, message: `Updated ${employeeId} day ${day} to ${status}` });
+    res.json({ success: true, message: `Updated ${employeeId} day ${day} to ${normalizeStatus(status)}` });
   } catch (error) {
     console.error('Error updating attendance:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -908,7 +928,7 @@ app.put('/api/attendance/:employeeId/:day', async (req, res) => {
 // Bulk update attendance for multiple employees on a day
 app.post('/api/attendance/bulk', async (req, res) => {
   try {
-    const { day, updates } = req.body; // updates: [{ employeeId, status }, ...]
+    const { day, updates, type } = req.body; // updates: [{ employeeId, status, type? }, ...]
     const dayNum = parseInt(day);
 
     if (dayNum < 1 || dayNum > 31) {
@@ -916,49 +936,133 @@ app.post('/api/attendance/bulk', async (req, res) => {
     }
 
     const sheets = await getSheets();
-
-    // Get all employee IDs and their row numbers
-    const response = await sheets.spreadsheets.values.get({
-      spreadsheetId: ATTENDANCE_SHEET_ID,
-      range: `'${LABOUR_ATTENDANCE_SHEET}'!A:A`,
-    });
-    const rows = response.data.values || [];
-
-    const employeeRowMap = {};
-    for (let i = 1; i < rows.length; i++) {
-      if (rows[i][0]) {
-        employeeRowMap[rows[i][0]] = i + 1;
-      }
-    }
-
-    // Column for the day (Day 1 = Column D = 4th column, Day 31 = Column AH = 34th column)
     const colLetter = getColumnLetter(dayNum + 3);
 
-    // Prepare batch update
-    const batchData = [];
-    for (const update of updates) {
-      const rowNum = employeeRowMap[update.employeeId];
-      if (rowNum) {
-        batchData.push({
-          range: `'${LABOUR_ATTENDANCE_SHEET}'!${colLetter}${rowNum}`,
-          values: [[update.status]]
-        });
+    // Group updates by sheet type
+    const grouped = {};
+    if (type && type !== 'all') {
+      grouped[type] = updates;
+    } else {
+      for (const update of updates) {
+        const t = update.type || 'labour';
+        if (!grouped[t]) grouped[t] = [];
+        grouped[t].push(update);
       }
     }
 
-    if (batchData.length > 0) {
-      await sheets.spreadsheets.values.batchUpdate({
+    let totalUpdated = 0;
+
+    for (const [sheetType, sheetUpdates] of Object.entries(grouped)) {
+      const sheetName = sheetType === 'staff' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
+
+      const response = await sheets.spreadsheets.values.get({
         spreadsheetId: ATTENDANCE_SHEET_ID,
+        range: `'${sheetName}'!A:A`,
+      });
+      const rows = response.data.values || [];
+
+      const employeeRowMap = {};
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i][0]) {
+          employeeRowMap[rows[i][0]] = i + 1;
+        }
+      }
+
+      const batchData = [];
+      for (const update of sheetUpdates) {
+        const rowNum = employeeRowMap[update.employeeId];
+        if (rowNum) {
+          batchData.push({
+            range: `'${sheetName}'!${colLetter}${rowNum}`,
+            values: [[normalizeStatus(update.status)]]
+          });
+        }
+      }
+
+      if (batchData.length > 0) {
+        await sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: ATTENDANCE_SHEET_ID,
+          requestBody: {
+            data: batchData,
+            valueInputOption: 'RAW'
+          }
+        });
+        totalUpdated += batchData.length;
+      }
+    }
+
+    res.json({ success: true, message: `Updated ${totalUpdated} attendance records` });
+  } catch (error) {
+    console.error('Error bulk updating attendance:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// PAYROLL API ENDPOINTS
+// ============================================
+
+const PAYROLL_SHEET_ID = '1_q5QsmF9gZ2jeJqDpcSHU2iCeJyjIAQntK92G4iFsOg';
+const MONTH_ABBRS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+const LABOUR_PAYROLL_HEADERS = ['Employee ID', 'Name of Employee', 'Designation', 'Deductions', 'Paid Days', 'RATE PER hour', 'total bf OT', 'OT Hours', 'OT Pay', 'Net salary'];
+const STAFF_PAYROLL_HEADERS  = ['Employee ID', 'Name of Employee', 'Designation', 'Deductions', 'Paid Days', 'RATE PER hour', 'Net salary'];
+
+function payrollRowToArray(row, type) {
+  if (type === 'staff') {
+    return [row.employeeId, row.name, row.designation, row.deductionAmount, row.paidDays, row.ratePerHour, row.netSalary];
+  }
+  return [row.employeeId, row.name, row.designation, row.deductionAmount, row.paidDays, row.ratePerHour, row.salaryBeforeOT, row.otHours, row.otPay, row.netSalary];
+}
+
+// Write calculated payroll to Monthly Payroll sheet
+app.post('/api/payroll', async (req, res) => {
+  try {
+    const { month, year, type, data } = req.body;
+    if (month === undefined || !year || !type || !Array.isArray(data)) {
+      return res.status(400).json({ success: false, error: 'Missing required fields: month, year, type, data' });
+    }
+
+    const sheets = await getSheets();
+    const tabName = `${type === 'staff' ? 'Staff' : 'Labour'} ${MONTH_ABBRS[month]}`;
+
+    // 1. Get current sheet metadata to check if tab exists
+    const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: PAYROLL_SHEET_ID });
+    const existingSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+    // 2. Create tab if it doesn't exist
+    if (!existingSheets.includes(tabName)) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: PAYROLL_SHEET_ID,
         requestBody: {
-          data: batchData,
-          valueInputOption: 'USER_ENTERED'
+          requests: [{
+            addSheet: { properties: { title: tabName } }
+          }]
         }
       });
     }
 
-    res.json({ success: true, message: `Updated ${batchData.length} attendance records` });
+    // 3. Clear the tab
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: PAYROLL_SHEET_ID,
+      range: `'${tabName}'!A:Z`,
+    });
+
+    // 4. Build rows: header + data
+    const headers = type === 'staff' ? STAFF_PAYROLL_HEADERS : LABOUR_PAYROLL_HEADERS;
+    const rows = [headers, ...data.map(row => payrollRowToArray(row, type))];
+
+    // 5. Write all at once
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: PAYROLL_SHEET_ID,
+      range: `'${tabName}'!A1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: rows }
+    });
+
+    res.json({ success: true, message: `Wrote ${data.length} records to "${tabName}"` });
   } catch (error) {
-    console.error('Error bulk updating attendance:', error);
+    console.error('Error writing payroll:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
