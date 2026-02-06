@@ -46,6 +46,10 @@ const ATTENDANCE_SHEET_ID = process.env.ATTENDANCE_SHEET_ID || '1NjZxG_LctqXZP2n
 const LABOUR_ATTENDANCE_SHEET = 'Labour attendence';
 const STAFF_ATTENDANCE_SHEET = 'Staff attendence';
 
+// PDC (Post-Dated Cheques) tracking sheet
+const PDC_SHEET_ID = process.env.PDC_SHEET_ID || '198RUJOsQf2XbLKM4S1C_OPyznT_Fsrn1JuH_isYLSlA';
+const PDC_SHEET_NAME = 'PDC Tracker';
+
 // Convert 1-based column number to letter(s): 1=A, 26=Z, 27=AA, 34=AH
 function getColumnLetter(colNum) {
   let letter = '';
@@ -954,31 +958,36 @@ app.post('/api/employees/:id/move', async (req, res) => {
     }
 
     // 2. Prepare data for target sheet
-    // Staff: [ID, Name, Designation, Rate/Day, Rate/Hour, Deduction, Other]
-    // Labour: [ID, Name, Designation, Rate/Day, Rate/Hour, OT Hours, Deduction, Other]
+    // ACTUAL column structures (different order!):
+    // Labour: [ID, Name, Designation, RatePerDay, RatePerHour, OTHours, NetSalary, Type]
+    // Staff:  [ID, Name, RatePerDay, Designation, Deductions, NetSalary, Type]
     let targetData;
     if (targetType === 'labour') {
-      // Moving Staff -> Labour: add OT Hours column (default 0)
+      // Moving Staff -> Labour
+      // Staff columns: [0]=ID, [1]=Name, [2]=RatePerDay, [3]=Designation, [4]=Deductions, [5]=NetSalary, [6]=Type
+      const ratePerDay = parseFloat(employeeData[2]) || 0;
+      const ratePerHour = (ratePerDay / 8).toFixed(2);
       targetData = [
-        employeeData[0], // ID
-        employeeData[1], // Name
-        employeeData[2], // Designation
-        employeeData[3], // Rate/Day
-        employeeData[4], // Rate/Hour
-        '0',             // OT Hours (new column for labour)
-        employeeData[5] || '', // Deduction
-        employeeData[6] || '', // Other
+        employeeData[0],        // ID
+        employeeData[1],        // Name
+        employeeData[3] || '',  // Designation (was index 3 in Staff)
+        employeeData[2] || '',  // RatePerDay (was index 2 in Staff)
+        ratePerHour,            // RatePerHour (calculated)
+        '0',                    // OTHours (default)
+        '',                     // NetSalary (recalculated later)
+        'Labour'                // Type
       ];
     } else {
-      // Moving Labour -> Staff: remove OT Hours column
+      // Moving Labour -> Staff
+      // Labour columns: [0]=ID, [1]=Name, [2]=Designation, [3]=RatePerDay, [4]=RatePerHour, [5]=OTHours, [6]=NetSalary, [7]=Type
       targetData = [
-        employeeData[0], // ID
-        employeeData[1], // Name
-        employeeData[2], // Designation
-        employeeData[3], // Rate/Day
-        employeeData[4], // Rate/Hour
-        employeeData[6] || '', // Deduction (was index 6 in labour)
-        employeeData[7] || '', // Other (was index 7 in labour)
+        employeeData[0],        // ID
+        employeeData[1],        // Name
+        employeeData[3] || '',  // RatePerDay (was index 3 in Labour)
+        employeeData[2] || '',  // Designation (was index 2 in Labour)
+        '0',                    // Deductions (default)
+        '',                     // NetSalary (recalculated later)
+        'Staff'                 // Type
       ];
     }
 
@@ -1634,6 +1643,281 @@ If asked about something not in the data, say you don't have that information.
     res.json({ success: true, response: assistantResponse });
   } catch (error) {
     console.error('Error in AI chat:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// PDC (POST-DATED CHEQUES) API ENDPOINTS
+// ============================================
+
+// PDC Headers: [BPV No, Company, Description, Cheque No, Cheque Date, Amount, Status, Notes]
+const PDC_HEADERS = ['BPV No', 'Company', 'Description', 'Cheque No', 'Cheque Date', 'Amount', 'Status', 'Notes'];
+
+// Helper: Ensure PDC sheet and tracker tab exist
+async function ensurePdcSheet(sheets) {
+  try {
+    const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: PDC_SHEET_ID });
+    const existingSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+    if (!existingSheets.includes(PDC_SHEET_NAME)) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: PDC_SHEET_ID,
+        requestBody: {
+          requests: [{ addSheet: { properties: { title: PDC_SHEET_NAME } } }]
+        }
+      });
+      // Add headers
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: PDC_SHEET_ID,
+        range: `'${PDC_SHEET_NAME}'!A1`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [PDC_HEADERS] }
+      });
+    }
+    return true;
+  } catch (error) {
+    console.error('Error ensuring PDC sheet:', error);
+    return false;
+  }
+}
+
+// Get all PDCs
+app.get('/api/pdc', async (req, res) => {
+  try {
+    const sheets = await getSheets();
+    await ensurePdcSheet(sheets);
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A:H`,
+    });
+
+    const rows = response.data.values || [];
+    const pdcs = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      if (row[0] || row[3]) { // Has BPV No or Cheque No
+        pdcs.push({
+          id: i,
+          rowIndex: i + 1,
+          bpvNo: row[0] || '',
+          company: row[1] || '',
+          description: row[2] || '',
+          chequeNo: row[3] || '',
+          chequeDate: row[4] || '',
+          amount: parseFloat(row[5]) || 0,
+          status: row[6] || 'Pending',
+          notes: row[7] || ''
+        });
+      }
+    }
+
+    res.json({ success: true, data: pdcs });
+  } catch (error) {
+    console.error('Error fetching PDCs:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create new PDC
+app.post('/api/pdc', async (req, res) => {
+  try {
+    const sheets = await getSheets();
+    await ensurePdcSheet(sheets);
+
+    const data = req.body;
+    const rowData = [[
+      data.bpvNo || '',
+      data.company || '',
+      data.description || '',
+      data.chequeNo || '',
+      data.chequeDate || '',
+      data.amount || '',
+      data.status || 'Pending',
+      data.notes || ''
+    ]];
+
+    // Find next empty row
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A:A`,
+    });
+    const nextRow = (response.data.values?.length || 1) + 1;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A${nextRow}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: rowData }
+    });
+
+    res.json({ success: true, data: { ...data, id: nextRow - 1, rowIndex: nextRow } });
+  } catch (error) {
+    console.error('Error creating PDC:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update PDC
+app.put('/api/pdc/:id', async (req, res) => {
+  try {
+    const rowIndex = parseInt(req.params.id);
+    const sheets = await getSheets();
+    const data = req.body;
+
+    const rowData = [[
+      data.bpvNo || '',
+      data.company || '',
+      data.description || '',
+      data.chequeNo || '',
+      data.chequeDate || '',
+      data.amount || '',
+      data.status || 'Pending',
+      data.notes || ''
+    ]];
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A${rowIndex}:H${rowIndex}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: { values: rowData }
+    });
+
+    res.json({ success: true, data: { ...data, rowIndex } });
+  } catch (error) {
+    console.error('Error updating PDC:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update PDC status only
+app.patch('/api/pdc/:id/status', async (req, res) => {
+  try {
+    const rowIndex = parseInt(req.params.id);
+    const { status } = req.body;
+    const sheets = await getSheets();
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!G${rowIndex}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [[status]] }
+    });
+
+    res.json({ success: true, status });
+  } catch (error) {
+    console.error('Error updating PDC status:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete PDC
+app.delete('/api/pdc/:id', async (req, res) => {
+  try {
+    const rowIndex = parseInt(req.params.id);
+    const sheets = await getSheets();
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A${rowIndex}:H${rowIndex}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['', '', '', '', '', '', '', '']] }
+    });
+
+    res.json({ success: true, message: 'PDC deleted' });
+  } catch (error) {
+    console.error('Error deleting PDC:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Sync PDC from BPV (extract PDC entries from a voucher)
+app.post('/api/pdc/sync-from-bpv/:bpvNo', async (req, res) => {
+  try {
+    const bpvNo = req.params.bpvNo;
+    const sheets = await getSheets();
+    await ensurePdcSheet(sheets);
+
+    // Get BPV data from all Bpv sheet
+    const bpvResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `'${ALL_BPV_SHEET}'!A:H`,
+    });
+    const bpvRows = bpvResponse.data.values || [];
+
+    // Find all line items for this BPV
+    const lineItems = [];
+    for (let i = 1; i < bpvRows.length; i++) {
+      const row = bpvRows[i];
+      if (row[0] === bpvNo) {
+        lineItems.push({
+          bpvNo: row[0],
+          company: row[1] || '',
+          description: row[2] || '',
+          date: row[3] || '',
+          chequeNo: row[4] || '',
+          chequeDate: row[5] || '',
+          amount: row[6] || '',
+          type: row[7] || ''
+        });
+      }
+    }
+
+    if (lineItems.length === 0) {
+      return res.status(404).json({ success: false, error: `No BPV found with number ${bpvNo}` });
+    }
+
+    // Check for PDC type entries and add to PDC tracker
+    const pdcEntries = lineItems.filter(item =>
+      item.type?.toUpperCase() === 'PDC' || item.chequeDate
+    );
+
+    if (pdcEntries.length === 0) {
+      return res.json({ success: true, message: 'No PDC entries found in this BPV', added: 0 });
+    }
+
+    // Get existing PDCs to avoid duplicates
+    const existingResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!D:D`,
+    });
+    const existingCheques = new Set((existingResponse.data.values || []).flat());
+
+    // Find next row
+    const pdcResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A:A`,
+    });
+    let nextRow = (pdcResponse.data.values?.length || 1) + 1;
+
+    let added = 0;
+    for (const entry of pdcEntries) {
+      if (!existingCheques.has(entry.chequeNo)) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: PDC_SHEET_ID,
+          range: `'${PDC_SHEET_NAME}'!A${nextRow}`,
+          valueInputOption: 'USER_ENTERED',
+          requestBody: { values: [[
+            entry.bpvNo,
+            entry.company,
+            entry.description,
+            entry.chequeNo,
+            entry.chequeDate,
+            entry.amount,
+            'Pending',
+            ''
+          ]] }
+        });
+        nextRow++;
+        added++;
+      }
+    }
+
+    res.json({ success: true, message: `Added ${added} PDC entries`, added });
+  } catch (error) {
+    console.error('Error syncing PDC from BPV:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
