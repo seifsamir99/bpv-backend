@@ -815,6 +815,150 @@ app.delete('/api/employees/:id', async (req, res) => {
   }
 });
 
+// Move employee between Labour and Staff
+app.post('/api/employees/:id/move', async (req, res) => {
+  try {
+    const employeeId = req.params.id;
+    const { targetType } = req.body; // 'labour' or 'staff'
+
+    if (!targetType || !['labour', 'staff'].includes(targetType)) {
+      return res.status(400).json({ success: false, error: 'targetType must be "labour" or "staff"' });
+    }
+
+    const sheets = await getSheets();
+    const sourceSheet = targetType === 'labour' ? STAFF_SALARY_SHEET : LABOUR_SALARY_SHEET;
+    const targetSheet = targetType === 'labour' ? LABOUR_SALARY_SHEET : STAFF_SALARY_SHEET;
+    const sourceAttSheet = targetType === 'labour' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
+    const targetAttSheet = targetType === 'labour' ? LABOUR_ATTENDANCE_SHEET : STAFF_ATTENDANCE_SHEET;
+
+    // 1. Get employee data from source salary sheet
+    const sourceRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${sourceSheet}'!A:H`,
+    });
+    const sourceRows = sourceRes.data.values || [];
+
+    let employeeData = null;
+    let sourceRowIndex = -1;
+
+    for (let i = 1; i < sourceRows.length; i++) {
+      if (sourceRows[i][0] === employeeId) {
+        employeeData = sourceRows[i];
+        sourceRowIndex = i;
+        break;
+      }
+    }
+
+    if (!employeeData) {
+      return res.status(404).json({ success: false, error: `Employee ${employeeId} not found in ${sourceSheet}` });
+    }
+
+    // 2. Prepare data for target sheet
+    // Staff: [ID, Name, Designation, Rate/Day, Rate/Hour, Deduction, Other]
+    // Labour: [ID, Name, Designation, Rate/Day, Rate/Hour, OT Hours, Deduction, Other]
+    let targetData;
+    if (targetType === 'labour') {
+      // Moving Staff -> Labour: add OT Hours column (default 0)
+      targetData = [
+        employeeData[0], // ID
+        employeeData[1], // Name
+        employeeData[2], // Designation
+        employeeData[3], // Rate/Day
+        employeeData[4], // Rate/Hour
+        '0',             // OT Hours (new column for labour)
+        employeeData[5] || '', // Deduction
+        employeeData[6] || '', // Other
+      ];
+    } else {
+      // Moving Labour -> Staff: remove OT Hours column
+      targetData = [
+        employeeData[0], // ID
+        employeeData[1], // Name
+        employeeData[2], // Designation
+        employeeData[3], // Rate/Day
+        employeeData[4], // Rate/Hour
+        employeeData[6] || '', // Deduction (was index 6 in labour)
+        employeeData[7] || '', // Other (was index 7 in labour)
+      ];
+    }
+
+    // 3. Find next empty row in target sheet and append
+    const targetRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${targetSheet}'!A:A`,
+    });
+    const targetRows = targetRes.data.values || [];
+    const nextRow = targetRows.length + 1;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${targetSheet}'!A${nextRow}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [targetData] }
+    });
+
+    // 4. Clear from source sheet
+    const clearCols = targetType === 'labour' ? 'A:G' : 'A:H';
+    const clearValues = targetType === 'labour'
+      ? [['', '', '', '', '', '', '']]
+      : [['', '', '', '', '', '', '', '']];
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SALARY_SHEET_ID,
+      range: `'${sourceSheet}'!A${sourceRowIndex + 1}:${clearCols.split(':')[1]}${sourceRowIndex + 1}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: clearValues }
+    });
+
+    // 5. Move attendance data
+    const sourceAttRes = await sheets.spreadsheets.values.get({
+      spreadsheetId: ATTENDANCE_SHEET_ID,
+      range: `'${sourceAttSheet}'!A:AH`,
+    });
+    const sourceAttRows = sourceAttRes.data.values || [];
+
+    for (let i = 1; i < sourceAttRows.length; i++) {
+      if (sourceAttRows[i][0] === employeeId) {
+        const attData = sourceAttRows[i];
+
+        // Append to target attendance sheet
+        const targetAttRes = await sheets.spreadsheets.values.get({
+          spreadsheetId: ATTENDANCE_SHEET_ID,
+          range: `'${targetAttSheet}'!A:A`,
+        });
+        const targetAttRows = targetAttRes.data.values || [];
+        const nextAttRow = targetAttRows.length + 1;
+
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: ATTENDANCE_SHEET_ID,
+          range: `'${targetAttSheet}'!A${nextAttRow}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [attData] }
+        });
+
+        // Clear from source attendance
+        const clearAttValues = new Array(attData.length).fill('');
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: ATTENDANCE_SHEET_ID,
+          range: `'${sourceAttSheet}'!A${i + 1}:AH${i + 1}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [clearAttValues] }
+        });
+
+        break;
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Employee ${employeeId} moved from ${sourceSheet} to ${targetSheet}`
+    });
+  } catch (error) {
+    console.error('Error moving employee:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============================================
 // ATTENDANCE API ENDPOINTS
 // ============================================
