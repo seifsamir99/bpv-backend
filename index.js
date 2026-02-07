@@ -1804,10 +1804,10 @@ app.post('/api/pdc', async (req, res) => {
       data.notes || ''
     ]];
 
-    // Find next empty row
+    // Find next empty row (using column D - Cheque No, which always has data)
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: PDC_SHEET_ID,
-      range: `'${PDC_SHEET_NAME}'!A:A`,
+      range: `'${PDC_SHEET_NAME}'!D:D`,
     });
     const nextRow = (response.data.values?.length || 1) + 1;
 
@@ -1936,37 +1936,74 @@ app.patch('/api/pdc/status-by-cheque/:chequeNo', async (req, res) => {
     const sheets = await getSheets();
     await ensurePdcSheet(sheets);
 
-    // Find row with this cheque number
+    // Find ALL rows with this cheque number (handle duplicates)
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: PDC_SHEET_ID,
       range: `'${PDC_SHEET_NAME}'!D:D`,
     });
     const rows = response.data.values || [];
 
+    const matchingRows = [];
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] === chequeNo) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: PDC_SHEET_ID,
-          range: `'${PDC_SHEET_NAME}'!G${i + 1}`,
-          valueInputOption: 'RAW',
-          requestBody: { values: [[status]] }
-        });
-        return res.json({ success: true, chequeNo, status });
+        matchingRows.push(i + 1); // Store row number (1-indexed)
       }
     }
 
-    // If cheque not found in PDC sheet, create new entry with status
+    // If found, update ALL matching rows to handle duplicates
+    if (matchingRows.length > 0) {
+      for (const rowNum of matchingRows) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: PDC_SHEET_ID,
+          range: `'${PDC_SHEET_NAME}'!G${rowNum}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [[status]] }
+        });
+      }
+      return res.json({ success: true, chequeNo, status, updatedRows: matchingRows.length });
+    }
+
+    // If cheque not found in PDC sheet, fetch full details from BPV and create entry
+    const bpvResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `'${ALL_BPV_SHEET}'!A:H`,
+    });
+    const bpvRows = bpvResponse.data.values || [];
+
+    // Find the line item with this cheque number
+    let chequeData = null;
+    for (let i = 1; i < bpvRows.length; i++) {
+      const row = bpvRows[i];
+      if (row[4] === chequeNo) { // Column E = Cheque No
+        chequeData = {
+          bpvNo: row[0] || '',
+          company: row[1] || '',
+          description: row[2] || '',
+          chequeNo: row[4] || '',
+          chequeDate: row[5] || '',
+          amount: row[6] || ''
+        };
+        break;
+      }
+    }
+
+    // Find next row in PDC tracker
     const allRowsResponse = await sheets.spreadsheets.values.get({
       spreadsheetId: PDC_SHEET_ID,
       range: `'${PDC_SHEET_NAME}'!A:A`,
     });
     const nextRow = (allRowsResponse.data.values?.length || 1) + 1;
 
+    // Create full entry with all details
+    const rowData = chequeData
+      ? [chequeData.bpvNo, chequeData.company, chequeData.description, chequeData.chequeNo, chequeData.chequeDate, chequeData.amount, status, '']
+      : ['', '', '', chequeNo, '', '', status, ''];
+
     await sheets.spreadsheets.values.update({
       spreadsheetId: PDC_SHEET_ID,
       range: `'${PDC_SHEET_NAME}'!A${nextRow}`,
       valueInputOption: 'RAW',
-      requestBody: { values: [['', '', '', chequeNo, '', '', status, '']] }
+      requestBody: { values: [rowData] }
     });
 
     res.json({ success: true, chequeNo, status, created: true });
