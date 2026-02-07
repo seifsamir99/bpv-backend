@@ -1911,6 +1911,65 @@ app.patch('/api/pdc/status-by-cheque/:chequeNo', async (req, res) => {
   }
 });
 
+// Bulk update status for multiple cheques
+app.patch('/api/pdc/bulk-status', async (req, res) => {
+  try {
+    const { chequeNumbers, status } = req.body;
+
+    if (!chequeNumbers || !Array.isArray(chequeNumbers) || chequeNumbers.length === 0) {
+      return res.status(400).json({ success: false, error: 'chequeNumbers array is required' });
+    }
+    if (!status) {
+      return res.status(400).json({ success: false, error: 'status is required' });
+    }
+
+    const sheets = await getSheets();
+    await ensurePdcSheet(sheets);
+
+    // Get all cheque numbers from column D to find row indices
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!D:D`,
+    });
+    const rows = response.data.values || [];
+
+    // Build batch update data
+    const batchData = [];
+    const updatedCheques = [];
+
+    for (let i = 1; i < rows.length; i++) {
+      const chequeNo = rows[i][0];
+      if (chequeNumbers.includes(chequeNo)) {
+        batchData.push({
+          range: `'${PDC_SHEET_NAME}'!G${i + 1}`,
+          values: [[status]]
+        });
+        updatedCheques.push(chequeNo);
+      }
+    }
+
+    if (batchData.length > 0) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: PDC_SHEET_ID,
+        requestBody: {
+          data: batchData,
+          valueInputOption: 'RAW'
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      status,
+      updatedCount: updatedCheques.length,
+      updatedCheques
+    });
+  } catch (error) {
+    console.error('Error bulk updating PDC statuses:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Sync PDC from BPV (extract PDC entries from a voucher)
 app.post('/api/pdc/sync-from-bpv/:bpvNo', async (req, res) => {
   try {
