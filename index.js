@@ -1833,6 +1833,84 @@ app.delete('/api/pdc/:id', async (req, res) => {
   }
 });
 
+// Get PDC statuses as a map (chequeNo -> status)
+app.get('/api/pdc/statuses', async (req, res) => {
+  try {
+    const sheets = await getSheets();
+    await ensurePdcSheet(sheets);
+
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A:H`,
+    });
+
+    const rows = response.data.values || [];
+    const statusMap = {};
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const chequeNo = row[3]; // Column D - Cheque No
+      const status = row[6];   // Column G - Status
+      if (chequeNo) {
+        statusMap[chequeNo] = status || 'Pending';
+      }
+    }
+
+    res.json({ success: true, data: statusMap });
+  } catch (error) {
+    console.error('Error fetching PDC statuses:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update status by cheque number
+app.patch('/api/pdc/status-by-cheque/:chequeNo', async (req, res) => {
+  try {
+    const chequeNo = decodeURIComponent(req.params.chequeNo);
+    const { status } = req.body;
+    const sheets = await getSheets();
+    await ensurePdcSheet(sheets);
+
+    // Find row with this cheque number
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!D:D`,
+    });
+    const rows = response.data.values || [];
+
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][0] === chequeNo) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: PDC_SHEET_ID,
+          range: `'${PDC_SHEET_NAME}'!G${i + 1}`,
+          valueInputOption: 'RAW',
+          requestBody: { values: [[status]] }
+        });
+        return res.json({ success: true, chequeNo, status });
+      }
+    }
+
+    // If cheque not found in PDC sheet, create new entry with status
+    const allRowsResponse = await sheets.spreadsheets.values.get({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A:A`,
+    });
+    const nextRow = (allRowsResponse.data.values?.length || 1) + 1;
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: PDC_SHEET_ID,
+      range: `'${PDC_SHEET_NAME}'!A${nextRow}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [['', '', '', chequeNo, '', '', status, '']] }
+    });
+
+    res.json({ success: true, chequeNo, status, created: true });
+  } catch (error) {
+    console.error('Error updating PDC status:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Sync PDC from BPV (extract PDC entries from a voucher)
 app.post('/api/pdc/sync-from-bpv/:bpvNo', async (req, res) => {
   try {
