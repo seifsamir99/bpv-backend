@@ -1528,8 +1528,8 @@ app.post('/api/ai/chat', async (req, res) => {
 
     const sheets = await getSheets();
 
-    // Fetch current data for context
-    const [labourEmpRes, staffEmpRes, labourAttRes, staffAttRes] = await Promise.all([
+    // Fetch current data for context (including BPV, PDC, CDC)
+    const [labourEmpRes, staffEmpRes, labourAttRes, staffAttRes, bpvRes, pdcStatusRes] = await Promise.all([
       sheets.spreadsheets.values.get({
         spreadsheetId: SALARY_SHEET_ID,
         range: `'${LABOUR_SALARY_SHEET}'!A:H`,
@@ -1545,6 +1545,16 @@ app.post('/api/ai/chat', async (req, res) => {
       sheets.spreadsheets.values.get({
         spreadsheetId: ATTENDANCE_SHEET_ID,
         range: `'${STAFF_ATTENDANCE_SHEET}'!A:AH`,
+      }),
+      // Fetch all BPV vouchers
+      sheets.spreadsheets.values.get({
+        spreadsheetId: SHEET_ID,
+        range: `'${ALL_BPV_SHEET}'!A:H`,
+      }),
+      // Fetch PDC tracker statuses
+      sheets.spreadsheets.values.get({
+        spreadsheetId: PDC_SHEET_ID,
+        range: `'${PDC_SHEET_NAME}'!A:H`,
       }),
     ]);
 
@@ -1575,15 +1585,55 @@ app.post('/api/ai/chat', async (req, res) => {
     const labourAtt = parseAttendance(labourAttRes.data.values);
     const staffAtt = parseAttendance(staffAttRes.data.values);
 
+    // Parse BPV vouchers (columns: BPV No, Company, Description, Date, Cheque No, Cheque Date, Amount, Type)
+    const bpvRows = (bpvRes.data.values || []).slice(1).filter(r => r[0]);
+    const bpvVouchers = bpvRows.map(r => ({
+      bpvNo: r[0],
+      company: r[1] || '',
+      description: r[2] || '',
+      date: r[3] || '',
+      chequeNo: r[4] || '',
+      chequeDate: r[5] || '',
+      amount: parseFloat((r[6] || '0').replace(/,/g, '')) || 0,
+      type: r[7] || 'Cash'
+    }));
+
+    // Parse PDC tracker statuses (columns: BPV No, Company, Description, Cheque No, Cheque Date, Amount, Status, Notes)
+    const pdcRows = (pdcStatusRes.data.values || []).slice(1).filter(r => r[3]); // Must have cheque number
+    const pdcStatusMap = {};
+    pdcRows.forEach(r => {
+      if (r[3]) pdcStatusMap[r[3]] = r[6] || 'Not Released';
+    });
+
+    // Extract PDC cheques (type = PDC)
+    const pdcCheques = bpvVouchers.filter(v => v.type?.toUpperCase() === 'PDC' && v.chequeNo).map(v => ({
+      ...v,
+      status: pdcStatusMap[v.chequeNo] || 'Not Released'
+    }));
+    const pdcNotReleased = pdcCheques.filter(p => p.status === 'Not Released');
+    const pdcReleased = pdcCheques.filter(p => p.status === 'Released');
+    const pdcTotalAmount = pdcCheques.reduce((sum, p) => sum + p.amount, 0);
+
+    // Extract CDC cheques (type = CDC)
+    const cdcCheques = bpvVouchers.filter(v => v.type?.toUpperCase() === 'CDC' && v.chequeNo).map(v => ({
+      ...v,
+      status: pdcStatusMap[v.chequeNo] || 'Pending'
+    }));
+    const cdcPending = cdcCheques.filter(c => c.status === 'Pending');
+    const cdcCleared = cdcCheques.filter(c => c.status === 'Cleared');
+    const cdcTotalAmount = cdcCheques.reduce((sum, c) => sum + c.amount, 0);
+
     // Build context summary
     const today = new Date();
     const monthName = today.toLocaleString('default', { month: 'long', year: 'numeric' });
 
     const context = `
-You are an HR Assistant for Newell Electromechanical Works LLC.
+You are an HR & Finance Assistant for Newell Electromechanical Works LLC.
+You have access to employee data, attendance, BPV vouchers, PDC cheques, and CDC cheques.
 
 CURRENT DATA (${monthName}):
 
+=== EMPLOYEES ===
 LABOUR EMPLOYEES (${labourEmps.length} total):
 ${labourEmps.slice(0, 20).map(e => `- ID ${e[0]}: ${e[1]} (${e[2]}) - Rate/Day: ${e[3]} AED, OT Hours: ${e[5] || 0}`).join('\n')}
 ${labourEmps.length > 20 ? `...and ${labourEmps.length - 20} more` : ''}
@@ -1592,7 +1642,7 @@ STAFF EMPLOYEES (${staffEmps.length} total):
 ${staffEmps.slice(0, 10).map(e => `- ID ${e[0]}: ${e[1]} (${e[2]}) - Rate/Day: ${e[3]} AED`).join('\n')}
 ${staffEmps.length > 10 ? `...and ${staffEmps.length - 10} more` : ''}
 
-ATTENDANCE SUMMARY (This Month):
+=== ATTENDANCE ===
 Labour attendance:
 ${labourAtt.slice(0, 15).map(a => `- ${a.name}: ${a.present} present, ${a.absent} absent, ${a.leave} leave`).join('\n')}
 ${labourAtt.length > 15 ? `...and ${labourAtt.length - 15} more` : ''}
@@ -1602,18 +1652,33 @@ Most absent Labour employees: ${labourAtt.sort((a,b) => b.absent - a.absent).sli
 Staff attendance:
 ${staffAtt.slice(0, 10).map(a => `- ${a.name}: ${a.present} present, ${a.absent} absent, ${a.leave} leave`).join('\n')}
 
-TOTALS:
-- Total employees: ${labourEmps.length + staffEmps.length}
-- Labour: ${labourEmps.length}
-- Staff: ${staffEmps.length}
+=== BPV VOUCHERS (${bpvVouchers.length} total) ===
+${bpvVouchers.slice(0, 30).map(v => `- BPV #${v.bpvNo}: ${v.company} | ${v.amount.toLocaleString()} AED | Type: ${v.type} | Cheque: ${v.chequeNo || 'N/A'} | Date: ${v.chequeDate || v.date}`).join('\n')}
+${bpvVouchers.length > 30 ? `...and ${bpvVouchers.length - 30} more vouchers` : ''}
 
-Calculate payroll estimates using:
+=== PDC CHEQUES (Post-Dated) - ${pdcCheques.length} total, ${pdcNotReleased.length} Not Released, ${pdcReleased.length} Released ===
+Total PDC Amount: ${pdcTotalAmount.toLocaleString()} AED
+${pdcCheques.slice(0, 25).map(p => `- Cheque #${p.chequeNo}: ${p.company} | ${p.amount.toLocaleString()} AED | Date: ${p.chequeDate} | Status: ${p.status} | BPV #${p.bpvNo}`).join('\n')}
+${pdcCheques.length > 25 ? `...and ${pdcCheques.length - 25} more PDC cheques` : ''}
+
+=== CDC CHEQUES (Current-Dated) - ${cdcCheques.length} total, ${cdcPending.length} Pending, ${cdcCleared.length} Cleared ===
+Total CDC Amount: ${cdcTotalAmount.toLocaleString()} AED
+${cdcCheques.slice(0, 25).map(c => `- Cheque #${c.chequeNo}: ${c.company} | ${c.amount.toLocaleString()} AED | Date: ${c.chequeDate} | Status: ${c.status} | BPV #${c.bpvNo}`).join('\n')}
+${cdcCheques.length > 25 ? `...and ${cdcCheques.length - 25} more CDC cheques` : ''}
+
+=== TOTALS ===
+- Total employees: ${labourEmps.length + staffEmps.length} (Labour: ${labourEmps.length}, Staff: ${staffEmps.length})
+- Total BPV vouchers: ${bpvVouchers.length}
+- Total PDC cheques: ${pdcCheques.length} (${pdcTotalAmount.toLocaleString()} AED)
+- Total CDC cheques: ${cdcCheques.length} (${cdcTotalAmount.toLocaleString()} AED)
+
+=== PAYROLL CALCULATION ===
 - Net Salary = (Rate/Day * Paid Days) + (OT Hours * Rate/Hour * 1.25) for Labour
 - Paid Days = Present + Off days
 - OT Rate = Rate/Day / 8 * 1.25
 
 Be concise and helpful. Format numbers with commas (e.g., 50,000.00 AED).
-If asked about something not in the data, say you don't have that information.
+When asked about a cheque number, search through PDC and CDC cheques to find it.
 `;
 
     // Build messages for Claude
