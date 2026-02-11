@@ -1360,14 +1360,15 @@ app.post('/api/attendance/bulk', async (req, res) => {
 const PAYROLL_SHEET_ID = '1_q5QsmF9gZ2jeJqDpcSHU2iCeJyjIAQntK92G4iFsOg';
 const MONTH_ABBRS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-const LABOUR_PAYROLL_HEADERS = ['Employee ID', 'Name of Employee', 'Designation', 'Deductions', 'Paid Days', 'RATE PER hour', 'total bf OT', 'OT Hours', 'OT Pay', 'Net salary'];
-const STAFF_PAYROLL_HEADERS  = ['Employee ID', 'Name of Employee', 'Designation', 'Deductions', 'Paid Days', 'RATE PER hour', 'Net salary'];
+const LABOUR_PAYROLL_HEADERS = ['Employee ID', 'Name of Employee', 'Designation', 'Deductions', 'Paid Days', 'RATE PER hour', 'total bf OT', 'OT Hours', 'OT Pay', 'Net salary', 'Payment Method'];
+const STAFF_PAYROLL_HEADERS  = ['Employee ID', 'Name of Employee', 'Designation', 'Deductions', 'Paid Days', 'RATE PER hour', 'Net salary', 'Payment Method'];
 
 function payrollRowToArray(row, type) {
+  const paymentMethod = row.paymentMethod || (row.isCash ? 'Cash' : 'Bank Transfer');
   if (type === 'staff') {
-    return [row.employeeId, row.name, row.designation, row.deductionAmount, row.paidDays, row.ratePerHour, row.netSalary];
+    return [row.employeeId, row.name, row.designation, row.deductionAmount, row.paidDays, row.ratePerHour, row.netSalary, paymentMethod];
   }
-  return [row.employeeId, row.name, row.designation, row.deductionAmount, row.paidDays, row.ratePerHour, row.salaryBeforeOT, row.otHours, row.otPay, row.netSalary];
+  return [row.employeeId, row.name, row.designation, row.deductionAmount, row.paidDays, row.ratePerHour, row.salaryBeforeOT, row.otHours, row.otPay, row.netSalary, paymentMethod];
 }
 
 // Write calculated payroll to Monthly Payroll sheet
@@ -1377,6 +1378,10 @@ app.post('/api/payroll', async (req, res) => {
     if (month === undefined || !year || !type || !Array.isArray(data)) {
       return res.status(400).json({ success: false, error: 'Missing required fields: month, year, type, data' });
     }
+
+    // Debug: Log received cash employees
+    const receivedCashCount = data.filter(row => row.isCash === true || row.paymentMethod === 'Cash').length;
+    console.log(`[Payroll POST] Received ${data.length} records, ${receivedCashCount} marked as cash`);
 
     const sheets = await getSheets();
     const tabName = `${type === 'staff' ? 'Staff' : 'Labour'} ${MONTH_ABBRS[month]}`;
@@ -1415,9 +1420,121 @@ app.post('/api/payroll', async (req, res) => {
       requestBody: { values: rows }
     });
 
-    res.json({ success: true, message: `Wrote ${data.length} records to "${tabName}"` });
+    // 6. Also save Cash employees to separate "Cash Jan" sheet
+    const cashData = data.filter(row => row.isCash || row.paymentMethod === 'Cash');
+    if (cashData.length > 0) {
+      const cashTabName = `Cash ${MONTH_ABBRS[month]}`;
+
+      // Create cash tab if it doesn't exist
+      const updatedSpreadsheet = await sheets.spreadsheets.get({ spreadsheetId: PAYROLL_SHEET_ID });
+      const updatedSheets = updatedSpreadsheet.data.sheets.map(s => s.properties.title);
+
+      if (!updatedSheets.includes(cashTabName)) {
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: PAYROLL_SHEET_ID,
+          requestBody: {
+            requests: [{
+              addSheet: { properties: { title: cashTabName } }
+            }]
+          }
+        });
+      }
+
+      // Clear and write cash data
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: PAYROLL_SHEET_ID,
+        range: `'${cashTabName}'!A:Z`,
+      });
+
+      const cashRows = [headers, ...cashData.map(row => payrollRowToArray(row, type))];
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: PAYROLL_SHEET_ID,
+        range: `'${cashTabName}'!A1`,
+        valueInputOption: 'RAW',
+        requestBody: { values: cashRows }
+      });
+    }
+
+    res.json({ success: true, message: `Wrote ${data.length} records to "${tabName}"${cashData.length > 0 ? ` and ${cashData.length} cash records to "Cash ${MONTH_ABBRS[month]}"` : ''}` });
   } catch (error) {
     console.error('Error writing payroll:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET saved payroll data for a specific month/year/type
+app.get('/api/payroll', async (req, res) => {
+  try {
+    const { month, year, type } = req.query;
+    if (month === undefined || !year || !type) {
+      return res.status(400).json({ success: false, error: 'Missing required query params: month, year, type' });
+    }
+
+    const sheets = await getSheets();
+    const tabName = `${type === 'staff' ? 'Staff' : 'Labour'} ${MONTH_ABBRS[parseInt(month)]}`;
+
+    // Check if tab exists
+    const spreadsheet = await sheets.spreadsheets.get({ spreadsheetId: PAYROLL_SHEET_ID });
+    const existingSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+    if (!existingSheets.includes(tabName)) {
+      return res.json({ success: true, data: [], message: 'No saved data for this period' });
+    }
+
+    // Read the data
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: PAYROLL_SHEET_ID,
+      range: `'${tabName}'!A:Z`,
+    });
+
+    const rows = response.data.values || [];
+    if (rows.length <= 1) {
+      return res.json({ success: true, data: [], message: 'No saved data for this period' });
+    }
+
+    // Parse rows into objects (skip header row)
+    const headers = rows[0];
+    const isStaff = type === 'staff';
+
+    // Helper to parse numbers that may have commas
+    const parseNum = (val) => parseFloat(String(val || '0').replace(/,/g, '')) || 0;
+
+    const data = rows.slice(1).map(row => {
+      if (isStaff) {
+        // Staff headers: Employee ID, Name, Designation, Deductions, Paid Days, Rate/Hr, Net salary, Payment Method
+        return {
+          employeeId: row[0],
+          name: row[1],
+          designation: row[2],
+          deductionAmount: parseNum(row[3]),
+          paidDays: parseNum(row[4]),
+          ratePerHour: parseNum(row[5]),
+          netSalary: parseNum(row[6]),
+          paymentMethod: row[7] || 'Bank Transfer',
+          isCash: row[7] === 'Cash',
+        };
+      } else {
+        // Labour headers: Employee ID, Name, Designation, Deductions, Paid Days, Rate/Hr, total bf OT, OT Hours, OT Pay, Net salary, Payment Method
+        return {
+          employeeId: row[0],
+          name: row[1],
+          designation: row[2],
+          deductionAmount: parseNum(row[3]),
+          paidDays: parseNum(row[4]),
+          ratePerHour: parseNum(row[5]),
+          salaryBeforeOT: parseNum(row[6]),
+          otHours: parseNum(row[7]),
+          otPay: parseNum(row[8]),
+          netSalary: parseNum(row[9]),
+          paymentMethod: row[10] || 'Bank Transfer',
+          isCash: row[10] === 'Cash',
+        };
+      }
+    });
+
+    res.json({ success: true, data, savedFromSheet: true });
+  } catch (error) {
+    console.error('Error loading payroll:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1677,8 +1794,9 @@ ${cdcCheques.length > 25 ? `...and ${cdcCheques.length - 25} more CDC cheques` :
 - Paid Days = Present + Off days
 - OT Rate = Rate/Day / 8 * 1.25
 
-Be concise and helpful. Format numbers with commas (e.g., 50,000.00 AED).
-When asked about a cheque number, search through PDC and CDC cheques to find it.
+CRITICAL: Reply like a normal person texting. NO markdown, NO asterisks, NO bullet points, NO dashes, NO formatting symbols.
+Just plain simple text. Example: "Cheque 1035 is cleared. 10,000 AED to Salam Express, dated Jan 15."
+Keep answers short - one or two sentences only.
 `;
 
     // Build messages for Claude
@@ -1772,7 +1890,7 @@ app.get('/api/pdc', async (req, res) => {
           description: row[2] || '',
           chequeNo: row[3] || '',
           chequeDate: row[4] || '',
-          amount: parseFloat(row[5]) || 0,
+          amount: parseFloat(String(row[5]).replace(/,/g, '')) || 0,
           status: row[6] || 'Pending',
           notes: row[7] || ''
         });
@@ -1981,7 +2099,7 @@ app.patch('/api/pdc/status-by-cheque/:chequeNo', async (req, res) => {
           description: row[2] || '',
           chequeNo: row[4] || '',
           chequeDate: row[5] || '',
-          amount: row[6] || ''
+          amount: String(row[6] || '').replace(/,/g, '') // Remove commas for clean number
         };
         break;
       }
