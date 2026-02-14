@@ -85,7 +85,8 @@ const buildVoucherPositionMap = () => {
     positions[bpvNum] = { bpvNoRow: base, dateRow: base + 1, dataRow: base + 7, totalRow: base + 9, format: 'transitional' };
   });
 
-  for (let i = 0; i < 43; i++) {
+  // Extended to support 100 vouchers (BPV 18-117)
+  for (let i = 0; i < 100; i++) {
     const base = 393 + (i * 27);
     positions[18 + i] = { bpvNoRow: base, dateRow: base + 1, dataRow: base + 7, totalRow: base + 9, format: 'new' };
   }
