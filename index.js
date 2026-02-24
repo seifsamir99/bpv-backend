@@ -45,6 +45,7 @@ const STAFF_SALARY_SHEET = 'Staff salary';
 const ATTENDANCE_SHEET_ID = process.env.ATTENDANCE_SHEET_ID || '1NjZxG_LctqXZP2nk1HvXbFG4rVVzeK6H4WZ-4iRtODE';
 const LABOUR_ATTENDANCE_SHEET = 'Labour attendence';
 const STAFF_ATTENDANCE_SHEET = 'Staff attendence';
+const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 // PDC (Post-Dated Cheques) tracking sheet
 const PDC_SHEET_ID = process.env.PDC_SHEET_ID || '198RUJOsQf2XbLKM4S1C_OPyznT_Fsrn1JuH_isYLSlA';
@@ -69,6 +70,60 @@ const CANONICAL_STATUSES = {
 function normalizeStatus(status) {
   if (!status) return status;
   return CANONICAL_STATUSES[status.toLowerCase()] || status;
+}
+
+// Get or create monthly attendance sheet (e.g., "Labour attendence Jan 2026")
+async function getOrCreateMonthlySheet(sheets, baseSheetName, month, year) {
+  const monthName = MONTH_NAMES[month];
+  const targetSheetName = `${baseSheetName} ${monthName} ${year}`;
+
+  // Get all sheets in the spreadsheet
+  const spreadsheet = await sheets.spreadsheets.get({
+    spreadsheetId: ATTENDANCE_SHEET_ID,
+    fields: 'sheets.properties'
+  });
+
+  const existingSheets = spreadsheet.data.sheets.map(s => s.properties.title);
+
+  // If monthly sheet exists, return it
+  if (existingSheets.includes(targetSheetName)) {
+    return targetSheetName;
+  }
+
+  // Find the base sheet ID to copy from
+  const baseSheet = spreadsheet.data.sheets.find(s => s.properties.title === baseSheetName);
+  if (!baseSheet) throw new Error(`Base sheet ${baseSheetName} not found`);
+
+  // Copy the base sheet
+  const copyResponse = await sheets.spreadsheets.sheets.copyTo({
+    spreadsheetId: ATTENDANCE_SHEET_ID,
+    sheetId: baseSheet.properties.sheetId,
+    requestBody: { destinationSpreadsheetId: ATTENDANCE_SHEET_ID }
+  });
+
+  // Rename the copied sheet
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: ATTENDANCE_SHEET_ID,
+    requestBody: {
+      requests: [{
+        updateSheetProperties: {
+          properties: {
+            sheetId: copyResponse.data.sheetId,
+            title: targetSheetName
+          },
+          fields: 'title'
+        }
+      }]
+    }
+  });
+
+  // Clear day columns (D2:AH) to start fresh - keep header row and employee info
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: ATTENDANCE_SHEET_ID,
+    range: `'${targetSheetName}'!D2:AH`
+  });
+
+  return targetSheetName;
 }
 
 // Build voucher position map
@@ -1175,11 +1230,13 @@ app.post('/api/employees/:id/fix-missing', async (req, res) => {
 // ATTENDANCE API ENDPOINTS
 // ============================================
 
-// Get attendance - supports ?type=labour|staff|all (default: all)
+// Get attendance - supports ?type=labour|staff|all (default: all), ?month=0-11, ?year=2026
 app.get('/api/attendance', async (req, res) => {
   try {
     const sheets = await getSheets();
     const type = req.query.type || 'all';
+    const month = req.query.month !== undefined ? parseInt(req.query.month) : new Date().getMonth();
+    const year = req.query.year !== undefined ? parseInt(req.query.year) : new Date().getFullYear();
     const attendance = [];
 
     const parseAttendanceRows = (rows, sheetType) => {
@@ -1205,18 +1262,20 @@ app.get('/api/attendance', async (req, res) => {
     };
 
     if (type === 'labour' || type === 'all') {
+      const labourSheetName = await getOrCreateMonthlySheet(sheets, LABOUR_ATTENDANCE_SHEET, month, year);
       const labourRes = await sheets.spreadsheets.values.get({
         spreadsheetId: ATTENDANCE_SHEET_ID,
-        range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AH`,
+        range: `'${labourSheetName}'!A:AH`,
       });
       parseAttendanceRows(labourRes.data.values || [], 'labour');
     }
 
     if (type === 'staff' || type === 'all') {
       try {
+        const staffSheetName = await getOrCreateMonthlySheet(sheets, STAFF_ATTENDANCE_SHEET, month, year);
         const staffRes = await sheets.spreadsheets.values.get({
           spreadsheetId: ATTENDANCE_SHEET_ID,
-          range: `'${STAFF_ATTENDANCE_SHEET}'!A:AH`,
+          range: `'${staffSheetName}'!A:AH`,
         });
         parseAttendanceRows(staffRes.data.values || [], 'staff');
       } catch (staffErr) {
@@ -1235,15 +1294,18 @@ app.get('/api/attendance', async (req, res) => {
 app.put('/api/attendance/:employeeId/:day', async (req, res) => {
   try {
     const { employeeId, day } = req.params;
-    const { status, type } = req.body;
+    const { status, type, month, year } = req.body;
     const dayNum = parseInt(day);
+    const monthNum = month !== undefined ? parseInt(month) : new Date().getMonth();
+    const yearNum = year !== undefined ? parseInt(year) : new Date().getFullYear();
 
     if (dayNum < 1 || dayNum > 31) {
       return res.status(400).json({ success: false, error: 'Invalid day' });
     }
 
-    const sheetName = type === 'staff' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
     const sheets = await getSheets();
+    const baseSheetName = type === 'staff' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
+    const sheetName = await getOrCreateMonthlySheet(sheets, baseSheetName, monthNum, yearNum);
 
     // Find the employee row
     const response = await sheets.spreadsheets.values.get({
@@ -1284,8 +1346,10 @@ app.put('/api/attendance/:employeeId/:day', async (req, res) => {
 // Bulk update attendance for multiple employees on a day
 app.post('/api/attendance/bulk', async (req, res) => {
   try {
-    const { day, updates, type } = req.body; // updates: [{ employeeId, status, type? }, ...]
+    const { day, updates, type, month, year } = req.body; // updates: [{ employeeId, status, type? }, ...]
     const dayNum = parseInt(day);
+    const monthNum = month !== undefined ? parseInt(month) : new Date().getMonth();
+    const yearNum = year !== undefined ? parseInt(year) : new Date().getFullYear();
 
     if (dayNum < 1 || dayNum > 31) {
       return res.status(400).json({ success: false, error: 'Invalid day' });
@@ -1309,7 +1373,8 @@ app.post('/api/attendance/bulk', async (req, res) => {
     let totalUpdated = 0;
 
     for (const [sheetType, sheetUpdates] of Object.entries(grouped)) {
-      const sheetName = sheetType === 'staff' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
+      const baseSheetName = sheetType === 'staff' ? STAFF_ATTENDANCE_SHEET : LABOUR_ATTENDANCE_SHEET;
+      const sheetName = await getOrCreateMonthlySheet(sheets, baseSheetName, monthNum, yearNum);
 
       const response = await sheets.spreadsheets.values.get({
         spreadsheetId: ATTENDANCE_SHEET_ID,
@@ -1646,6 +1711,12 @@ app.post('/api/ai/chat', async (req, res) => {
 
     const sheets = await getSheets();
 
+    // Get current month's attendance sheets
+    const currentMonth = new Date().getMonth();
+    const currentYear = new Date().getFullYear();
+    const labourAttSheetName = await getOrCreateMonthlySheet(sheets, LABOUR_ATTENDANCE_SHEET, currentMonth, currentYear);
+    const staffAttSheetName = await getOrCreateMonthlySheet(sheets, STAFF_ATTENDANCE_SHEET, currentMonth, currentYear);
+
     // Fetch current data for context (including BPV, PDC, CDC)
     const [labourEmpRes, staffEmpRes, labourAttRes, staffAttRes, bpvRes, pdcStatusRes] = await Promise.all([
       sheets.spreadsheets.values.get({
@@ -1658,11 +1729,11 @@ app.post('/api/ai/chat', async (req, res) => {
       }),
       sheets.spreadsheets.values.get({
         spreadsheetId: ATTENDANCE_SHEET_ID,
-        range: `'${LABOUR_ATTENDANCE_SHEET}'!A:AH`,
+        range: `'${labourAttSheetName}'!A:AH`,
       }),
       sheets.spreadsheets.values.get({
         spreadsheetId: ATTENDANCE_SHEET_ID,
-        range: `'${STAFF_ATTENDANCE_SHEET}'!A:AH`,
+        range: `'${staffAttSheetName}'!A:AH`,
       }),
       // Fetch all BPV vouchers
       sheets.spreadsheets.values.get({
