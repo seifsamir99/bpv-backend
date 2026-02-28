@@ -336,7 +336,7 @@ const syncToAllBpv = async (bpvNum, voucherData) => {
 app.post('/api/bpv', async (req, res) => {
   try {
     const sheets = await getSheets();
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `'${SHEET_NAME}'!A1:G2000` });
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `'${SHEET_NAME}'!A1:G3200` });
     const rows = response.data.values || [];
 
     // Find empty slot
