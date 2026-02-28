@@ -218,7 +218,7 @@ app.get('/api/bpv', async (req, res) => {
     const sheets = await getSheets();
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAME}'!A1:G2000`,
+      range: `'${SHEET_NAME}'!A1:G3200`,
     });
 
     const rows = response.data.values || [];
@@ -245,7 +245,7 @@ app.get('/api/bpv/next-number', async (req, res) => {
     const sheets = await getSheets();
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAME}'!A1:G2000`,
+      range: `'${SHEET_NAME}'!A1:G3200`,
     });
 
     const rows = response.data.values || [];
