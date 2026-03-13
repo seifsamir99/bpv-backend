@@ -140,8 +140,8 @@ const buildVoucherPositionMap = () => {
     positions[bpvNum] = { bpvNoRow: base, dateRow: base + 1, dataRow: base + 7, totalRow: base + 9, format: 'transitional' };
   });
 
-  // Extended to support 100 vouchers (BPV 18-117)
-  for (let i = 0; i < 100; i++) {
+  // Extended to support 133 vouchers (BPV 18-150)
+  for (let i = 0; i < 133; i++) {
     const base = 393 + (i * 27);
     positions[18 + i] = { bpvNoRow: base, dateRow: base + 1, dataRow: base + 7, totalRow: base + 9, format: 'new' };
   }
@@ -218,7 +218,7 @@ app.get('/api/bpv', async (req, res) => {
     const sheets = await getSheets();
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAME}'!A1:G3200`,
+      range: `'${SHEET_NAME}'!A1:G5000`,
     });
 
     const rows = response.data.values || [];
@@ -245,7 +245,7 @@ app.get('/api/bpv/next-number', async (req, res) => {
     const sheets = await getSheets();
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: `'${SHEET_NAME}'!A1:G3200`,
+      range: `'${SHEET_NAME}'!A1:G5000`,
     });
 
     const rows = response.data.values || [];
@@ -336,7 +336,7 @@ const syncToAllBpv = async (bpvNum, voucherData) => {
 app.post('/api/bpv', async (req, res) => {
   try {
     const sheets = await getSheets();
-    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `'${SHEET_NAME}'!A1:G3200` });
+    const response = await sheets.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `'${SHEET_NAME}'!A1:G5000` });
     const rows = response.data.values || [];
 
     // Find empty slot
