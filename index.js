@@ -3,6 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const { google } = require('googleapis');
 const Anthropic = require('@anthropic-ai/sdk');
+const multer = require('multer');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const app = express();
 app.use(cors());
@@ -184,7 +189,7 @@ const parseVoucherAtPosition = (rows, bpvNum, pos) => {
   const lineItems = [];
   const skipLabels = ['TOTAL AMOUNT', 'Prepared By', 'Received By', 'Approved By', 'Checked By', '___'];
 
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 20; i++) {
     const itemRow = dataRow + i;
     const description = getCell(rows, itemRow, 1);
     if (skipLabels.some(label => String(description).includes(label))) continue;
@@ -474,7 +479,7 @@ app.delete('/api/bpv/:id', async (req, res) => {
       valueInputOption: 'RAW', requestBody: { values: [['']] }
     });
 
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 20; i++) {
       await sheets.spreadsheets.values.update({
         spreadsheetId: SHEET_ID, range: `'${SHEET_NAME}'!A${pos.dataRow + i}:G${pos.dataRow + i}`,
         valueInputOption: 'RAW', requestBody: { values: [[String(i + 1), '', '', '', '', '', '']] }
@@ -2348,6 +2353,273 @@ app.post('/api/pdc/sync-from-bpv/:bpvNo', async (req, res) => {
   } catch (error) {
     console.error('Error syncing PDC from BPV:', error);
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ── LPO Generator Routes ──────────────────────────────────────────────────────
+const upload = multer({ dest: os.tmpdir() });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const COMPANY_NAME = process.env.COMPANY_NAME || 'Newell Electromechanical Works L.L.C';
+const COMPANY_TRN = process.env.COMPANY_TRN || '100280024900003';
+const LETTERHEAD_PATH = path.join(__dirname, 'assets', 'letterhead.jpg');
+const LETTERHEAD_HDR_PATH = path.join(__dirname, 'assets', 'letterhead_header.jpg');
+
+// In-memory LPO counter (resets on restart — good enough for sequential numbering)
+let lpoCounter = 1001;
+
+app.get('/api/lpo-gen/next-number', (req, res) => {
+  const year = new Date().getFullYear();
+  res.json({ success: true, lpo_number: `LPO-${year}-${String(lpoCounter).padStart(4, '0')}`, counter: lpoCounter });
+});
+
+// Sites — kept minimal since frontend uses PREDEFINED_SITES
+let lpoSites = [];
+app.get('/api/lpo-gen/sites', (req, res) => res.json({ success: true, sites: lpoSites }));
+app.post('/api/lpo-gen/sites', (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (!name) return res.status(400).json({ success: false, error: 'Name required' });
+  if (!lpoSites.includes(name)) lpoSites.push(name);
+  res.json({ success: true, sites: lpoSites });
+});
+app.delete('/api/lpo-gen/sites/:idx', (req, res) => {
+  const idx = parseInt(req.params.idx);
+  if (idx < 0 || idx >= lpoSites.length) return res.status(400).json({ success: false, error: 'Invalid index' });
+  lpoSites.splice(idx, 1);
+  res.json({ success: true, sites: lpoSites });
+});
+
+// Extract quotation data using Claude Vision
+app.post('/api/lpo-gen/extract', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ success: false, error: 'No file uploaded' });
+  try {
+    const fileData = fs.readFileSync(req.file.path);
+    const base64 = fileData.toString('base64');
+    const mime = req.file.mimetype || 'image/jpeg';
+
+    const prompt = `Extract supplier quotation data from this document. Return ONLY valid JSON with these fields:
+{
+  "supplier_name": "",
+  "supplier_contact": "",
+  "supplier_email": "",
+  "supplier_phone": "",
+  "supplier_address": "",
+  "supplier_trn": "",
+  "quotation_number": "",
+  "payment_terms": "",
+  "vat_percent": 5,
+  "notes": "",
+  "line_items": [
+    { "description": "", "quantity": 1, "unit": "Nos", "unit_price": 0, "total_price": 0 }
+  ]
+}`;
+
+    const message = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: mime, data: base64 } },
+          { type: 'text', text: prompt }
+        ]
+      }]
+    });
+
+    const text = message.content[0].text;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON found in response');
+    const data = JSON.parse(jsonMatch[0]);
+    res.json({ success: true, data });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  } finally {
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+  }
+});
+
+// Generate LPO PDF
+app.post('/api/lpo-gen/pdf', async (req, res) => {
+  const { lpo = {}, supplier = {}, line_items = [], notes = '' } = req.body;
+  const vatPct = parseFloat(lpo.vat_percent || 5);
+
+  try {
+    const tmpPath = path.join(os.tmpdir(), `lpo-${Date.now()}.pdf`);
+    const doc = new PDFDocument({ size: 'A4', margin: 0, autoFirstPage: true });
+    const stream = fs.createWriteStream(tmpPath);
+    doc.pipe(stream);
+
+    const PW = doc.page.width;
+    const PH = doc.page.height;
+    const ML = 36, MR = 36;
+    const contentW = PW - ML - MR;
+
+    // Background letterhead
+    if (fs.existsSync(LETTERHEAD_PATH)) {
+      doc.image(LETTERHEAD_PATH, 0, 0, { width: PW, height: PH });
+    }
+
+    // Calculate header height from header image
+    let topY = 100;
+    if (fs.existsSync(LETTERHEAD_HDR_PATH)) {
+      const sizeOf = (imgPath) => {
+        const buf = fs.readFileSync(imgPath);
+        // Parse JPEG dimensions
+        let offset = 2;
+        while (offset < buf.length) {
+          if (buf[offset] !== 0xFF) break;
+          const marker = buf[offset + 1];
+          if (marker >= 0xC0 && marker <= 0xC3) {
+            return { height: buf.readUInt16BE(offset + 5), width: buf.readUInt16BE(offset + 7) };
+          }
+          offset += 2 + buf.readUInt16BE(offset + 2);
+        }
+        return { width: 595, height: 100 };
+      };
+      const { width: iw, height: ih } = sizeOf(LETTERHEAD_HDR_PATH);
+      topY = PW * (ih / iw) + 4;
+    }
+
+    let y = topY;
+    const lineH = 14;
+    const col1 = ML, col2 = ML + 70, col3 = ML + 220, col4 = ML + 295;
+
+    doc.font('Helvetica-Bold').fontSize(9);
+
+    // Info table rows
+    const infoRows = [
+      ['LPO No:', lpo.lpo_id || '', 'Supplier:', supplier.name || ''],
+      ['Date:', lpo.lpo_date || '', 'Quote Ref:', lpo.quote_ref || ''],
+      ['Newell TRN:', COMPANY_TRN, '', ''],
+    ];
+
+    infoRows.forEach(([l1, v1, l2, v2]) => {
+      doc.font('Helvetica-Bold').fontSize(9).text(l1, col1, y, { width: 65 });
+      doc.font('Helvetica').fontSize(9).text(v1, col2, y, { width: 145 });
+      if (l2) { doc.font('Helvetica-Bold').fontSize(9).text(l2, col3, y, { width: 70 }); }
+      if (v2) { doc.font('Helvetica').fontSize(9).text(v2, col4, y, { width: contentW - (col4 - ML) }); }
+      y += lineH;
+    });
+
+    y += 4;
+
+    // Project box
+    if (lpo.project) {
+      const projText = `PROJECT: ${lpo.project}`;
+      const projH = doc.heightOfString(projText, { width: contentW - 12 }) + 6;
+      doc.rect(ML, y, contentW, projH).stroke();
+      doc.font('Helvetica').fontSize(9).text(projText, ML + 6, y + 3, { width: contentW - 12 });
+      y += projH + 4;
+    }
+
+    // Line items table header
+    const cols = [
+      { x: ML,       w: 24,  label: 'SN',          align: 'center' },
+      { x: ML + 24,  w: 228, label: 'Description',  align: 'left'   },
+      { x: ML + 252, w: 35,  label: 'Qty',          align: 'center' },
+      { x: ML + 287, w: 35,  label: 'Unit',         align: 'center' },
+      { x: ML + 322, w: 78,  label: 'Rate (AED)',   align: 'right'  },
+      { x: ML + 400, w: 78,  label: 'Total (AED)',  align: 'right'  },
+    ];
+
+    const hdrH = 16;
+    doc.rect(ML, y, contentW, hdrH).fillAndStroke('#e0e0e0', 'black');
+    doc.fillColor('black').font('Helvetica-Bold').fontSize(9);
+    cols.forEach(c => doc.text(c.label, c.x + 2, y + 3, { width: c.w - 4, align: c.align }));
+    y += hdrH;
+
+    // Line items rows
+    let subtotal = 0;
+    doc.font('Helvetica').fontSize(8);
+    line_items.forEach((item, i) => {
+      const up = parseFloat(item.unit_price || 0);
+      const qty = parseFloat(item.quantity || 0);
+      const tot = parseFloat(item.total_price || up * qty);
+      subtotal += tot;
+
+      const rowH = Math.max(14, doc.heightOfString(item.description || '', { width: cols[1].w - 4 }) + 4);
+      const bg = i % 2 === 0 ? 'white' : '#f8f8f8';
+      doc.rect(ML, y, contentW, rowH).fillAndStroke(bg, 'black');
+      doc.fillColor('black');
+      doc.text(String(i + 1), cols[0].x + 2, y + 3, { width: cols[0].w - 4, align: 'center' });
+      doc.text(item.description || '', cols[1].x + 2, y + 3, { width: cols[1].w - 4 });
+      const qtyStr = qty === Math.floor(qty) ? String(Math.floor(qty)) : String(qty);
+      doc.text(qtyStr, cols[2].x + 2, y + 3, { width: cols[2].w - 4, align: 'center' });
+      doc.text(item.unit || '', cols[3].x + 2, y + 3, { width: cols[3].w - 4, align: 'center' });
+      doc.text(up.toLocaleString('en-AE', { minimumFractionDigits: 2 }), cols[4].x + 2, y + 3, { width: cols[4].w - 4, align: 'right' });
+      doc.text(tot.toLocaleString('en-AE', { minimumFractionDigits: 2 }), cols[5].x + 2, y + 3, { width: cols[5].w - 4, align: 'right' });
+      y += rowH;
+    });
+
+    // Totals
+    const vatAmt = subtotal * vatPct / 100;
+    const totalAmt = subtotal + vatAmt;
+    const totX = cols[4].x, totW = cols[4].w + cols[5].w;
+    [
+      ['Grand Total (AED):', subtotal],
+      [`VAT ${vatPct}%:`, vatAmt],
+      ['TOTAL (AED):', totalAmt],
+    ].forEach(([label, val], i) => {
+      const isTotal = i === 2;
+      if (isTotal) doc.rect(totX, y, totW, 14).fillAndStroke('#e0e0e0', 'black');
+      else doc.rect(totX, y, totW, 14).stroke();
+      doc.fillColor('black').font(isTotal ? 'Helvetica-Bold' : 'Helvetica').fontSize(9);
+      const valStr = val.toLocaleString('en-AE', { minimumFractionDigits: 2 });
+      doc.text(label, totX + 2, y + 3, { width: cols[4].w - 4, align: 'right' });
+      doc.text(valStr, cols[5].x + 2, y + 3, { width: cols[5].w - 4, align: 'right' });
+      y += 14;
+    });
+
+    y += 8;
+
+    // Terms & Conditions
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('black').text('Terms & Conditions:', ML, y);
+    y += 12;
+    doc.font('Helvetica').fontSize(8);
+    let cnum = 1;
+    if (lpo.delivery_site) {
+      doc.text(`${cnum}. Delivery: At Site — ${lpo.delivery_site}`, ML + 8, y, { width: contentW - 8 });
+      y += doc.heightOfString(`${cnum}. Delivery: At Site — ${lpo.delivery_site}`, { width: contentW - 8 }) + 2;
+      cnum++;
+    }
+    if (lpo.delivery_contact || lpo.delivery_phone) {
+      const contactLine = `${cnum}. For delivery arrangements contact: ${lpo.delivery_contact || ''}${lpo.delivery_phone ? ' on ' + lpo.delivery_phone : ''}`;
+      doc.text(contactLine, ML + 8, y, { width: contentW - 8 });
+      y += 12; cnum++;
+    }
+    if (lpo.payment_terms) {
+      doc.text(`${cnum}. Payment Terms: ${lpo.payment_terms}`, ML + 8, y, { width: contentW - 8 });
+      y += 12; cnum++;
+    }
+    doc.text(`${cnum}. Supplier must provide original tax invoice along with delivery of goods.`, ML + 8, y, { width: contentW - 8 });
+    y += 16;
+
+    // Approved by
+    doc.font('Helvetica-Bold').fontSize(8).text('Approved By', ML, y);
+    y += 11;
+    doc.font('Helvetica').fontSize(8).text('Hesham Youssef', ML, y);
+    y += 11;
+    doc.text('Managing Partner', ML, y);
+    y += 14;
+    doc.text('Signature: ___________________________________', ML, y);
+
+    doc.end();
+
+    await new Promise((resolve, reject) => {
+      stream.on('finish', resolve);
+      stream.on('error', reject);
+    });
+
+    // Increment counter after successful generation
+    lpoCounter++;
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${lpo.lpo_id || 'LPO'}.pdf"`);
+    const pdfBuffer = fs.readFileSync(tmpPath);
+    res.send(pdfBuffer);
+    fs.unlinkSync(tmpPath);
+  } catch (e) {
+    console.error('LPO PDF error:', e);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
