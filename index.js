@@ -2182,22 +2182,16 @@ app.patch('/api/pdc/status-by-cheque/:chequeNo', async (req, res) => {
       }
     }
 
-    // Find next row in PDC tracker
-    const allRowsResponse = await sheets.spreadsheets.values.get({
-      spreadsheetId: PDC_SHEET_ID,
-      range: `'${PDC_SHEET_NAME}'!A:A`,
-    });
-    const nextRow = (allRowsResponse.data.values?.length || 1) + 1;
-
-    // Create full entry with all details
+    // Create full entry with all details — use append to avoid overwriting existing rows
     const rowData = chequeData
       ? [chequeData.bpvNo, chequeData.company, chequeData.description, chequeData.chequeNo, chequeData.chequeDate, chequeData.amount, status, '']
       : ['', '', '', chequeNo, '', '', status, ''];
 
-    await sheets.spreadsheets.values.update({
+    await sheets.spreadsheets.values.append({
       spreadsheetId: PDC_SHEET_ID,
-      range: `'${PDC_SHEET_NAME}'!A${nextRow}`,
+      range: `'${PDC_SHEET_NAME}'!A:H`,
       valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [rowData] }
     });
 
