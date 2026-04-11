@@ -2358,7 +2358,6 @@ app.post('/api/pdc/sync-from-bpv/:bpvNo', async (req, res) => {
 
 // ── LPO Generator Routes ──────────────────────────────────────────────────────
 const upload = multer({ dest: os.tmpdir() });
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const COMPANY_NAME = process.env.COMPANY_NAME || 'Newell Electromechanical Works L.L.C';
 const COMPANY_TRN = process.env.COMPANY_TRN || '100280024900003';
 const LETTERHEAD_PATH = path.join(__dirname, 'assets', 'letterhead.jpg');
