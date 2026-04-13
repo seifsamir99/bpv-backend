@@ -13,6 +13,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Helper: parse numbers from Google Sheets which may have comma-formatted values like "1,000.00"
+function parseNum(val) {
+  if (!val && val !== 0) return 0;
+  return parseFloat(String(val).replace(/,/g, '')) || 0;
+}
+
 // Initialize Google Sheets API
 const getAuth = () => {
   const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
@@ -539,10 +545,10 @@ app.get('/api/employees', async (req, res) => {
             employeeId: row[0],
             name: row[1],
             designation: row[2] || '',
-            ratePerDay: parseFloat(row[3]) || 0,
-            ratePerHour: parseFloat(row[4]) || 0,
-            otHours: parseFloat(row[5]) || 0,
-            netSalary: parseFloat(row[6]) || 0,
+            ratePerDay: parseNum(row[3]) || 0,
+            ratePerHour: parseNum(row[4]) || 0,
+            otHours: parseNum(row[5]) || 0,
+            netSalary: parseNum(row[6]) || 0,
             type: row[7] || 'Labour',
             rowIndex: i + 1, // 1-indexed for Google Sheets
             sheetType: 'labour'
@@ -566,10 +572,10 @@ app.get('/api/employees', async (req, res) => {
             id: row[0],
             employeeId: row[0],
             name: row[1],
-            ratePerDay: parseFloat(row[2]) || 0,
+            ratePerDay: parseNum(row[2]) || 0,
             designation: row[3] || '',
-            deductions: parseFloat(row[4]) || 0,
-            netSalary: parseFloat(row[5]) || 0,
+            deductions: parseNum(row[4]) || 0,
+            netSalary: parseNum(row[5]) || 0,
             type: row[6] || 'Staff',
             rowIndex: i + 1,
             sheetType: 'staff'
@@ -707,10 +713,10 @@ app.get('/api/employees/:id', async (req, res) => {
             employeeId: row[0],
             name: row[1],
             designation: row[2] || '',
-            ratePerDay: parseFloat(row[3]) || 0,
-            ratePerHour: parseFloat(row[4]) || 0,
-            otHours: parseFloat(row[5]) || 0,
-            netSalary: parseFloat(row[6]) || 0,
+            ratePerDay: parseNum(row[3]) || 0,
+            ratePerHour: parseNum(row[4]) || 0,
+            otHours: parseNum(row[5]) || 0,
+            netSalary: parseNum(row[6]) || 0,
             type: row[7] || 'Labour',
             rowIndex: i + 1,
             sheetType: 'labour'
@@ -735,10 +741,10 @@ app.get('/api/employees/:id', async (req, res) => {
             id: row[0],
             employeeId: row[0],
             name: row[1],
-            ratePerDay: parseFloat(row[2]) || 0,
+            ratePerDay: parseNum(row[2]) || 0,
             designation: row[3] || '',
-            deductions: parseFloat(row[4]) || 0,
-            netSalary: parseFloat(row[5]) || 0,
+            deductions: parseNum(row[4]) || 0,
+            netSalary: parseNum(row[5]) || 0,
             type: row[6] || 'Staff',
             rowIndex: i + 1,
             sheetType: 'staff'
