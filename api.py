@@ -952,7 +952,7 @@ Provide a helpful, concise response about the user's purchase and accounting dat
 
 
 if __name__ == "__main__":
-    port = int(os.getenv('API_PORT', 5000))
+    port = int(os.getenv('PORT') or os.getenv('API_PORT', 5000))
     debug = os.getenv('FLASK_ENV') == 'development'
 
     print(f"Starting Purchase & Accounting API on port {port}")
