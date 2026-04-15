@@ -7,7 +7,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from sheets_operations import SheetsDB
 from new_bpv_service import NewBPVService
-from ai_extraction_openai import AIExtractor
+from ai_extraction import AIExtractor
 from pdf_generator import PDFGenerator
 from approval_workflow import ApprovalWorkflow
 from reporting import ReportGenerator
