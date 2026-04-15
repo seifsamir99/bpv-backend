@@ -25,26 +25,38 @@ class SheetsDB:
 
     def _get_credentials(self):
         """Get Google API credentials"""
-        # Check in current directory and parent directory
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+
+        # 1. Railway split-key pattern
+        email = os.getenv('GOOGLE_SERVICE_ACCOUNT_EMAIL')
+        private_key = os.getenv('GOOGLE_PRIVATE_KEY')
+        if email and private_key:
+            info = {
+                "type": "service_account",
+                "client_email": email,
+                "private_key": private_key.replace('\\n', '\n'),
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+            return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+
+        # 2. Full JSON env var
+        import json
+        creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+        if creds_json:
+            info = json.loads(creds_json)
+            return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+
+        # 3. Local files (dev)
         script_dir = os.path.dirname(os.path.abspath(__file__))
         parent_dir = os.path.dirname(script_dir)
 
-        token_paths = ['token.json', os.path.join(parent_dir, 'token.json')]
-        creds_paths = ['credentials.json', os.path.join(parent_dir, 'credentials.json')]
-
-        for token_path in token_paths:
+        for token_path in ['token.json', os.path.join(parent_dir, 'token.json')]:
             if os.path.exists(token_path):
-                return Credentials.from_authorized_user_file(
-                    token_path,
-                    ['https://www.googleapis.com/auth/spreadsheets']
-                )
+                return Credentials.from_authorized_user_file(token_path, scopes)
 
-        for creds_path in creds_paths:
+        for creds_path in ['credentials.json', os.path.join(parent_dir, 'credentials.json')]:
             if os.path.exists(creds_path):
-                return service_account.Credentials.from_service_account_file(
-                    creds_path,
-                    scopes=['https://www.googleapis.com/auth/spreadsheets']
-                )
+                return service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
 
         raise Exception("No valid credentials found")
 
