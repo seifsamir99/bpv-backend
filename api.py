@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from sheets_operations import SheetsDB
 from new_bpv_service import NewBPVService
+from employee_attendance_service import EmployeeAttendanceService
 from ai_extraction import AIExtractor
 from pdf_generator import PDFGenerator
 from approval_workflow import ApprovalWorkflow
@@ -27,6 +28,7 @@ CORS(app)  # Enable CORS for frontend
 # Initialize services
 db = SheetsDB()
 bpv_service = NewBPVService()
+emp_service = EmployeeAttendanceService()
 ai_extractor = AIExtractor()
 pdf_gen = PDFGenerator()
 approval = ApprovalWorkflow()
@@ -961,6 +963,177 @@ Provide a helpful, concise response about the user's purchase and accounting dat
             "error": str(e),
             "response": f"I'm having trouble accessing the AI service. Error: {str(e)}"
         })
+
+
+# ============================================================================
+# EMPLOYEES
+# ============================================================================
+
+@app.route('/api/employees', methods=['GET'])
+def get_employees():
+    emp_type = request.args.get('type')
+    employees = emp_service.get_employees(emp_type)
+    return jsonify({'success': True, 'data': employees})
+
+
+@app.route('/api/employees/validation', methods=['GET'])
+def validate_employees():
+    issues = emp_service.validate_employees()
+    return jsonify({'success': True, 'totalIssues': len(issues), 'issues': issues})
+
+
+@app.route('/api/employees/next-id', methods=['GET'])
+def get_next_employee_id():
+    emp_type = request.args.get('type', 'labour')
+    next_id = emp_service.get_next_employee_id(emp_type)
+    return jsonify({'success': True, 'data': {'nextId': next_id}})
+
+
+@app.route('/api/employees/ot/bulk', methods=['POST'])
+def bulk_update_ot():
+    updates = request.json.get('updates', [])
+    count = emp_service.bulk_update_ot(updates)
+    return jsonify({'success': True, 'message': f'Updated {count} OT records'})
+
+
+@app.route('/api/employees/<employee_id>', methods=['GET'])
+def get_employee(employee_id):
+    emp = emp_service.get_employee(employee_id)
+    if emp is None:
+        return jsonify({'success': False, 'error': 'Employee not found'}), 404
+    return jsonify({'success': True, 'data': emp})
+
+
+@app.route('/api/employees', methods=['POST'])
+def create_employee():
+    data = request.json
+    emp = emp_service.create_employee(data)
+    return jsonify({'success': True, 'data': emp}), 201
+
+
+@app.route('/api/employees/<employee_id>', methods=['PUT'])
+def update_employee(employee_id):
+    data = request.json
+    result = emp_service.update_employee(employee_id, data)
+    if result is None:
+        return jsonify({'success': False, 'error': 'Employee not found'}), 404
+    return jsonify({'success': True, 'data': result})
+
+
+@app.route('/api/employees/<employee_id>', methods=['DELETE'])
+def delete_employee(employee_id):
+    msg = emp_service.delete_employee(employee_id)
+    if msg is None:
+        return jsonify({'success': False, 'error': 'Employee not found'}), 404
+    return jsonify({'success': True, 'message': msg})
+
+
+@app.route('/api/employees/<employee_id>/move', methods=['POST'])
+def move_employee(employee_id):
+    target_type = request.json.get('targetType')
+    if target_type not in ('labour', 'staff'):
+        return jsonify({'success': False, 'error': 'targetType must be "labour" or "staff"'}), 400
+    ok, msg = emp_service.move_employee(employee_id, target_type)
+    if not ok:
+        return jsonify({'success': False, 'error': msg}), 404
+    return jsonify({'success': True, 'message': msg})
+
+
+@app.route('/api/employees/<employee_id>/fix-missing', methods=['POST'])
+def fix_missing_salary(employee_id):
+    body = request.json or {}
+    target_type = body.get('targetType')
+    if target_type not in ('labour', 'staff'):
+        return jsonify({'success': False, 'error': 'targetType must be "labour" or "staff"'}), 400
+    emp_data, err = emp_service.fix_missing_salary(
+        employee_id, target_type,
+        body.get('ratePerDay', 0), body.get('ratePerHour', 0), body.get('otHours', 0)
+    )
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True, 'message': f'Created salary record for {emp_data["name"]}', 'data': emp_data})
+
+
+@app.route('/api/employees/<employee_id>/ot', methods=['PUT'])
+def update_employee_ot(employee_id):
+    ot_hours = request.json.get('otHours')
+    ok = emp_service.update_employee_ot(employee_id, ot_hours)
+    if not ok:
+        return jsonify({'success': False, 'error': 'Employee not found'}), 404
+    return jsonify({'success': True, 'message': f'Updated OT hours for {employee_id}'})
+
+
+# ============================================================================
+# ATTENDANCE
+# ============================================================================
+
+@app.route('/api/attendance', methods=['GET'])
+def get_attendance():
+    emp_type = request.args.get('type', 'all')
+    month = int(request.args['month']) if 'month' in request.args else None
+    year = int(request.args['year']) if 'year' in request.args else None
+    data = emp_service.get_attendance(emp_type, month, year)
+    return jsonify({'success': True, 'data': data})
+
+
+@app.route('/api/attendance/<employee_id>/<int:day>', methods=['PUT'])
+def update_attendance(employee_id, day):
+    body = request.json or {}
+    status = body.get('status')
+    emp_type = body.get('type', 'labour')
+    month = body.get('month')
+    year = body.get('year')
+    ok, err = emp_service.update_attendance(employee_id, day, status, emp_type, month, year)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True, 'message': f'Updated {employee_id} day {day} to {status}'})
+
+
+@app.route('/api/attendance/bulk', methods=['POST'])
+def bulk_update_attendance():
+    body = request.json or {}
+    day = body.get('day')
+    updates = body.get('updates', [])
+    emp_type = body.get('type')
+    month = body.get('month')
+    year = body.get('year')
+    count, err = emp_service.bulk_update_attendance(day, updates, emp_type, month, year)
+    if err:
+        return jsonify({'success': False, 'error': err}), 400
+    return jsonify({'success': True, 'message': f'Updated {count} attendance records'})
+
+
+# ============================================================================
+# PAYROLL
+# ============================================================================
+
+@app.route('/api/payroll', methods=['POST'])
+def write_payroll():
+    body = request.json or {}
+    month = body.get('month')
+    year = body.get('year')
+    emp_type = body.get('type')
+    data = body.get('data', [])
+    if month is None or not year or not emp_type:
+        return jsonify({'success': False, 'error': 'Missing required fields: month, year, type, data'}), 400
+    count, cash_count, tab_name, month_abbr = emp_service.write_payroll(month, year, emp_type, data)
+    msg = f'Wrote {count} records to "{tab_name}"'
+    if cash_count:
+        msg += f' and {cash_count} cash records to "Cash {month_abbr}"'
+    return jsonify({'success': True, 'message': msg})
+
+
+@app.route('/api/payroll', methods=['GET'])
+def get_payroll():
+    month = request.args.get('month')
+    year = request.args.get('year')
+    emp_type = request.args.get('type')
+    if month is None or not year or not emp_type:
+        return jsonify({'success': False, 'error': 'Missing required query params: month, year, type'}), 400
+    data, msg = emp_service.get_payroll(month, year, emp_type)
+    if msg:
+        return jsonify({'success': True, 'data': data, 'message': msg})
+    return jsonify({'success': True, 'data': data, 'savedFromSheet': True})
 
 
 if __name__ == "__main__":
