@@ -208,10 +208,16 @@ def update_pdc_status(cheque_no):
 
 @app.route('/api/pdc/bulk-status', methods=['PATCH'])
 def bulk_update_pdc_status():
-    """Bulk update PDC statuses. Body: {updates: [{chequeNo, status}]}"""
+    """Bulk update PDC statuses.
+    Accepts: {chequeNumbers: [...], status: "..."} or {updates: [{chequeNo, status}]}
+    """
     try:
         data = request.json
-        updates = data.get('updates', [])
+        if 'chequeNumbers' in data:
+            status = data.get('status', 'Not Released')
+            updates = [{'chequeNo': c, 'status': status} for c in data['chequeNumbers']]
+        else:
+            updates = data.get('updates', [])
         result = bpv_service.bulk_update_pdc_status(updates)
         return jsonify(result)
     except Exception as e:
@@ -246,10 +252,16 @@ def update_cdc_status(cheque_no):
 
 @app.route('/api/cdc/bulk-status', methods=['PATCH'])
 def bulk_update_cdc_status():
-    """Bulk update CDC statuses. Body: {updates: [{chequeNo, status}]}"""
+    """Bulk update CDC statuses.
+    Accepts: {chequeNumbers: [...], status: "..."} or {updates: [{chequeNo, status}]}
+    """
     try:
         data = request.json
-        updates = data.get('updates', [])
+        if 'chequeNumbers' in data:
+            status = data.get('status', 'Not Released')
+            updates = [{'chequeNo': c, 'status': status} for c in data['chequeNumbers']]
+        else:
+            updates = data.get('updates', [])
         result = bpv_service.bulk_update_cdc_status(updates)
         return jsonify(result)
     except Exception as e:
