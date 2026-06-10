@@ -17,12 +17,17 @@ class AIExtractor:
     """Extract structured data from documents using Claude"""
 
     def __init__(self):
-        api_key = os.getenv('ANTHROPIC_API_KEY')
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY not set in environment")
+        self._api_key = os.getenv('ANTHROPIC_API_KEY')
+        self._client = None
+        self.model = "claude-opus-4-5-20251101"
 
-        self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-opus-4-5-20251101"  # Latest Opus 4.5
+    @property
+    def client(self):
+        if self._client is None:
+            if not self._api_key:
+                raise ValueError("ANTHROPIC_API_KEY not set in environment")
+            self._client = anthropic.Anthropic(api_key=self._api_key)
+        return self._client
 
     def extract_from_image(self, image_path, document_type):
         """Extract data from image file"""
@@ -200,6 +205,44 @@ Return ONLY a JSON object with this exact structure:
                 "error": f"Failed to parse JSON: {str(e)}",
                 "raw_response": response_text
             }
+
+    def extract_from_text(self, text, document_type):
+        """Extract structured data from plain text (e.g. PDF text layer)"""
+        prompt = f"""Extract structured data from the following {document_type} text.
+
+Return ONLY a JSON object with these fields:
+{{
+  "vendor_name": "string",
+  "vendor_contact": "string",
+  "vendor_email": "string",
+  "vendor_phone": "string",
+  "quotation_number": "string",
+  "quotation_date": "YYYY-MM-DD",
+  "validity_date": "YYYY-MM-DD",
+  "payment_terms": "string",
+  "currency": "AED",
+  "vat_percent": 5,
+  "notes": "string"
+}}
+
+Document text:
+{text}"""
+
+        message = self.client.messages.create(
+            model=self.model,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        response_text = message.content[0].text
+        try:
+            start_idx = response_text.find('{')
+            end_idx = response_text.rfind('}') + 1
+            if start_idx != -1 and end_idx > start_idx:
+                return {"success": True, "data": json.loads(response_text[start_idx:end_idx])}
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return {"success": False, "error": "Could not parse response", "raw_response": response_text}
 
     def extract_from_voice(self, audio_text, context="general"):
         """Extract structured data from voice-transcribed text
