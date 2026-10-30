@@ -7,3 +7,8 @@ __pycache__/
 .tmp/
 venv/
 .venv/
+
+# Scanned signatures and company stamp stay off GitHub (public repo).
+# They live in D:\Antixecutionssets and are deployed from there.
+assets/hesham_signature_*.png
+assets/company_stamp.png

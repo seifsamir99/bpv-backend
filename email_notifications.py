@@ -9,7 +9,6 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from sheets_operations import SheetsDB
 
 load_dotenv()
 
@@ -30,10 +29,21 @@ class EmailNotifier:
             print("WARNING: Email notifications disabled (SMTP credentials not configured)")
 
     def send_email(self, to_email, subject, html_body, plain_body=None):
-        """Send HTML email"""
+        """Send HTML email. Returns True/False."""
+        ok, _error = self.send_email_detailed(to_email, subject, html_body, plain_body)
+        return ok
+
+    def send_email_detailed(self, to_email, subject, html_body, plain_body=None):
+        """Send HTML email and return (ok, error_message).
+
+        Same as send_email() but surfaces the failure reason instead of
+        swallowing it, so callers (e.g. the supplier outreach dashboard) can
+        show the user why a send failed.
+        """
         if not self.enabled:
-            print(f"Email skipped (not configured): {subject} to {to_email}")
-            return False
+            msg = "SMTP credentials not configured (SMTP_USER / SMTP_PASSWORD)"
+            print(f"Email skipped ({msg}): {subject} to {to_email}")
+            return False, msg
 
         msg = MIMEMultipart('alternative')
         msg['From'] = self.from_email
@@ -50,14 +60,20 @@ class EmailNotifier:
         msg.attach(part2)
 
         try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
                 server.starttls()
                 server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.from_email, to_email, msg.as_string())
-            return True
+            return True, None
+        except smtplib.SMTPAuthenticationError as e:
+            error = (f"SMTP login rejected ({e.smtp_code}). Gmail requires an App Password, "
+                     f"not the account password. Check SMTP_PASSWORD in .env.")
+            print(f"Failed to send email: {error}")
+            return False, error
         except Exception as e:
-            print(f"Failed to send email: {str(e)}")
-            return False
+            error = f"{type(e).__name__}: {e}"
+            print(f"Failed to send email: {error}")
+            return False, error
 
     def notify_lpo_pending_approval(self, lpo_data, approver_email):
         """Notify approver about pending LPO"""
@@ -306,6 +322,10 @@ class EmailNotifier:
 
 def check_and_send_notifications():
     """Check database and send notifications for various conditions"""
+    # Imported lazily so EmailNotifier can be used without pulling in the
+    # Google Sheets stack (the supplier outreach tool imports this module).
+    from sheets_operations import SheetsDB
+
     db = SheetsDB()
     notifier = EmailNotifier()
 

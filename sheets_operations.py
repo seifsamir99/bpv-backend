@@ -10,6 +10,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
 
+import sheet_cache
+from google_service import build_sheets_service
+
 load_dotenv()
 
 
@@ -63,7 +66,7 @@ class SheetsDB:
     def _get_service(self):
         """Build Google Sheets service"""
         creds = self._get_credentials()
-        return build('sheets', 'v4', credentials=creds)
+        return build_sheets_service(creds)
 
     def _get_next_id(self, entity_type, prefix):
         """Generate next ID for entity type (e.g., QT-2026-01-001)"""
@@ -104,6 +107,7 @@ class SheetsDB:
 
         # Update counter
         new_row = [entity_type, str(next_number), year, month]
+        sheet_cache.invalidate(f"{self.sheet_id}:")
         self.service.spreadsheets().values().update(
             spreadsheetId=self.sheet_id,
             range=f"Counters!A{row_index}:D{row_index}",
@@ -130,6 +134,7 @@ class SheetsDB:
             str(changes)
         ]
 
+        sheet_cache.invalidate(f"{self.sheet_id}:")
         self.service.spreadsheets().values().append(
             spreadsheetId=self.sheet_id,
             range="Audit Log!A2",
@@ -139,6 +144,10 @@ class SheetsDB:
 
     def get_all(self, sheet_name):
         """Get all rows from a sheet"""
+        cache_key = f"{self.sheet_id}:{sheet_name}"
+        hit, cached = sheet_cache.get(cache_key)
+        if hit:
+            return cached
         result = self.service.spreadsheets().values().get(
             spreadsheetId=self.sheet_id,
             range=f"{sheet_name}!A1:ZZ10000"
@@ -146,6 +155,7 @@ class SheetsDB:
 
         rows = result.get('values', [])
         if not rows:
+            sheet_cache.put(cache_key, [])
             return []
 
         headers = rows[0]
@@ -159,6 +169,7 @@ class SheetsDB:
             item = dict(zip(headers, row))
             data.append(item)
 
+        sheet_cache.put(cache_key, data)
         return data
 
     def get_by_id(self, sheet_name, id_column, id_value):
@@ -205,6 +216,7 @@ class SheetsDB:
             row.append(data.get(header, ""))
 
         # Append row - use USER_ENTERED so dates are interpreted correctly
+        sheet_cache.invalidate(f"{self.sheet_id}:")
         self.service.spreadsheets().values().append(
             spreadsheetId=self.sheet_id,
             range=f"{sheet_name}!A2",
@@ -257,6 +269,7 @@ class SheetsDB:
                 updated_row[col_index] = value
 
         # Update row - use USER_ENTERED so dates are interpreted correctly
+        sheet_cache.invalidate(f"{self.sheet_id}:")
         self.service.spreadsheets().values().update(
             spreadsheetId=self.sheet_id,
             range=f"{sheet_name}!A{row_index}:ZZ{row_index}",
