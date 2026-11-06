@@ -594,7 +594,8 @@ class EmployeeAttendanceService:
                 _parse_num(r.get('otPay', 0)),
                 _parse_num(r.get('netSalary', 0)), payment_method,
                 _parse_num(r.get('bonus', 0)), r.get('bonusReason', '') or '',
-                r.get('deductionReason', '') or '', r.get('deductionNote', '') or ''))
+                r.get('deductionReason', '') or '', r.get('deductionNote', '') or '',
+                _parse_num(r.get('sundayOtHours', 0))))
 
         def fn(conn):
             with conn.cursor() as cur:
@@ -607,7 +608,8 @@ class EmployeeAttendanceService:
                            (year, month, emp_type, employee_id, name, designation,
                             deduction_amount, paid_days, rate_per_hour,
                             salary_before_ot, ot_hours, ot_pay, net_salary, payment_method,
-                            bonus, bonus_reason, deduction_reason, deduction_note)
+                            bonus, bonus_reason, deduction_reason, deduction_note,
+                            sunday_ot_hours)
                            VALUES %s
                            ON CONFLICT (year, month, emp_type, employee_id) DO UPDATE SET
                              name=EXCLUDED.name, designation=EXCLUDED.designation,
@@ -616,7 +618,8 @@ class EmployeeAttendanceService:
                              ot_hours=EXCLUDED.ot_hours, ot_pay=EXCLUDED.ot_pay,
                              net_salary=EXCLUDED.net_salary, payment_method=EXCLUDED.payment_method,
                              bonus=EXCLUDED.bonus, bonus_reason=EXCLUDED.bonus_reason,
-                             deduction_reason=EXCLUDED.deduction_reason, deduction_note=EXCLUDED.deduction_note""",
+                             deduction_reason=EXCLUDED.deduction_reason, deduction_note=EXCLUDED.deduction_note,
+                             sunday_ot_hours=EXCLUDED.sunday_ot_hours""",
                         rows, page_size=200)
         db.transaction(fn)
 
@@ -682,6 +685,8 @@ class EmployeeAttendanceService:
                 # OT applies to staff too (since 2026-07-23); old staff rows have NULLs → 0
                 'otHours': _parse_num(row['ot_hours']),
                 'otPay': _parse_num(row['ot_pay']),
+                # Part of otHours worked on Sundays (paid x1, not x1.25).
+                'sundayOtHours': _parse_num(row.get('sunday_ot_hours', 0)),
             }
             if not is_staff:
                 rec['salaryBeforeOT'] = _parse_num(row['salary_before_ot'])
@@ -700,7 +705,7 @@ class EmployeeAttendanceService:
         year = int(year)
         rows = db.q(
             f"""SELECT e.id, e.name, e.designation, e.rate_per_day, e.type,
-                       m.ot_hours, m.bonus, m.bonus_reason,
+                       m.ot_hours, m.sunday_ot_hours, m.bonus, m.bonus_reason,
                        m.deduction_amount, m.deduction_reason, m.deduction_note,
                        m.ot_source
                 FROM employees e
@@ -714,7 +719,8 @@ class EmployeeAttendanceService:
             'designation': r['designation'],
             'ratePerDay': _parse_num(r['rate_per_day']),
             'type': 'staff' if (r['type'] or '').lower() == 'staff' else 'labour',
-            'otHours': _parse_num(r['ot_hours']),
+            'otHours': _parse_num(r['ot_hours']),              # weekday OT, x1.25
+            'sundayOtHours': _parse_num(r['sunday_ot_hours']), # Sunday OT, x1
             # 'log'  = auto-summed from the engineers' daily labour_day_log
             # 'manual' = typed here by the office (and then never overwritten)
             'otSource': r['ot_source'] or 'manual',
@@ -735,6 +741,7 @@ class EmployeeAttendanceService:
         # (payload key, db column, coercer)
         FIELD_MAP = [
             ('otHours', 'ot_hours', _parse_num),
+            ('sundayOtHours', 'sunday_ot_hours', _parse_num),
             ('bonus', 'bonus', _parse_num),
             ('bonusReason', 'bonus_reason', lambda v: v or ''),
             ('deductionAmount', 'deduction_amount', _parse_num),
@@ -752,9 +759,10 @@ class EmployeeAttendanceService:
                 continue
             vals = [coerce(upd[key]) for key, col, coerce in FIELD_MAP if key in upd]
             # The frontend only sends fields the office actually edited, so an
-            # otHours here means someone typed it: pin the row to 'manual' and
-            # labour_log_service will stop overwriting it from the daily log.
-            if 'otHours' in upd:
+            # otHours / sundayOtHours here means someone typed it: pin the row
+            # to 'manual' and labour_log_service will stop overwriting it from
+            # the daily log. One flag covers both boxes.
+            if 'otHours' in upd or 'sundayOtHours' in upd:
                 cols += ('ot_source',)
                 vals.append('manual')
             groups.setdefault(cols, []).append([str(upd['employeeId']), year, db_month] + vals)

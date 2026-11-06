@@ -157,7 +157,8 @@ create table if not exists month_end (
   employee_id      text not null,
   year             int  not null,
   month            int  not null check (month between 1 and 12),
-  ot_hours         numeric not null default 0,
+  ot_hours         numeric not null default 0,   -- weekday OT, paid x1.25
+  sunday_ot_hours  numeric not null default 0,   -- Sunday OT, paid x1
   bonus            numeric not null default 0,
   bonus_reason     text    not null default '',
   deduction_amount numeric not null default 0,
@@ -536,3 +537,10 @@ alter table month_end add column if not exists ot_source text not null default '
 -- The two overlap but are not the same people (an electric foreman fills the
 -- sheet without being on the engineers' check-in roster).
 alter table employees add column if not exists crew_sheet_enabled boolean not null default false;
+
+-- 2026-11-06: Sunday OT is paid at the plain hourly rate (x1), weekday OT at
+-- x1.25. ot_hours now holds weekday OT only; Sunday OT lives here. The site
+-- log splits the two by entry_date (Sunday = DOW 0); on the Month-End page
+-- the office types them into two boxes.
+alter table month_end add column if not exists sunday_ot_hours numeric not null default 0;
+alter table payroll   add column if not exists sunday_ot_hours numeric not null default 0;

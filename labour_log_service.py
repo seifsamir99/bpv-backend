@@ -379,9 +379,16 @@ def _sync_month_end_ot(cur, emp_ids, year, month):
     # log alone yields NO row for an employee whose last day was just deleted,
     # so the upsert would silently skip him and leave a stale OT total behind in
     # payroll. The LEFT JOIN guarantees one row per employee, zero included.
+    #
+    # Sunday OT is paid at x1 and weekday OT at x1.25, so the two are totalled
+    # separately. Sunday is decided by the DATE (DOW 0), not by the Off status,
+    # so a Sunday logged as Present + OT is still counted as Sunday OT.
     cur.execute(
-        """INSERT INTO month_end (employee_id, year, month, ot_hours, ot_source)
-           SELECT ids.id, %s, %s, COALESCE(SUM(l.ot_hours), 0), 'log'
+        """INSERT INTO month_end (employee_id, year, month, ot_hours, sunday_ot_hours, ot_source)
+           SELECT ids.id, %s, %s,
+                  COALESCE(SUM(l.ot_hours) FILTER (WHERE EXTRACT(DOW FROM l.entry_date) <> 0), 0),
+                  COALESCE(SUM(l.ot_hours) FILTER (WHERE EXTRACT(DOW FROM l.entry_date) = 0), 0),
+                  'log'
            FROM unnest(%s::text[]) AS ids(id)
            LEFT JOIN labour_day_log l
              ON l.employee_id = ids.id
@@ -389,7 +396,9 @@ def _sync_month_end_ot(cur, emp_ids, year, month):
             AND EXTRACT(MONTH FROM l.entry_date) = %s
            GROUP BY ids.id
            ON CONFLICT (employee_id, year, month) DO UPDATE SET
-             ot_hours = EXCLUDED.ot_hours, ot_source = 'log'
+             ot_hours = EXCLUDED.ot_hours,
+             sunday_ot_hours = EXCLUDED.sunday_ot_hours,
+             ot_source = 'log'
            WHERE month_end.ot_source <> 'manual'""",
         (year, month, [str(e) for e in emp_ids], year, month))
 
@@ -428,7 +437,7 @@ def list_month(year, month):
             by_emp[emp_id] = {
                 'employeeId': emp_id, 'name': r['name'],
                 'designation': r['designation'] or '',
-                'days': {}, 'totalOt': 0, 'totalHours': 0,
+                'days': {}, 'totalOt': 0, 'totalSundayOt': 0, 'totalHours': 0,
                 'presentDays': 0, 'absentDays': 0,
                 'hasConflict': False,
             }
@@ -449,6 +458,8 @@ def list_month(year, month):
             'markedByName': r['marked_by_name'] or '',
         }
         rec['totalOt'] += ot
+        if r['entry_date'].weekday() == 6:  # Sunday OT, paid at x1
+            rec['totalSundayOt'] += ot
         rec['totalHours'] += hours
         # Absent is the only status the absence penalty in payroll charges for,
         # and only a normal working day counts as present — a Leave, Joined,
