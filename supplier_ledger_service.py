@@ -314,16 +314,34 @@ def update_supplier(supplier_id, data):
     return _supplier_json(row)
 
 
-def delete_supplier(supplier_id):
+def delete_supplier(supplier_id, with_records=False):
+    """Delete a supplier. with_records also deletes its invoices, payments and
+    their allocations (all in one transaction); without it a supplier that
+    still has records is refused."""
+    sid = int(supplier_id)
     n = db.q_one(
-        """SELECT (SELECT count(*) FROM supplier_invoices WHERE supplier_id=%s) AS inv,
+        """SELECT (SELECT count(*) FROM suppliers WHERE id=%s) AS sup,
+                  (SELECT count(*) FROM supplier_invoices WHERE supplier_id=%s) AS inv,
                   (SELECT count(*) FROM supplier_payments WHERE supplier_id=%s) AS pay""",
-        (int(supplier_id), int(supplier_id)))
-    if n['inv'] or n['pay']:
+        (sid, sid, sid))
+    if not n['sup']:
+        raise LedgerError("Supplier not found")
+    if (n['inv'] or n['pay']) and not with_records:
         raise LedgerError(
             f"Supplier has {n['inv']} invoice(s) and {n['pay']} payment(s) -- delete those first")
-    db.execute("DELETE FROM suppliers WHERE id = %s", (int(supplier_id),))
-    return {'success': True}
+
+    def fn(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                """DELETE FROM supplier_payment_allocations
+                    WHERE payment_id IN (SELECT id FROM supplier_payments WHERE supplier_id=%s)
+                       OR invoice_id IN (SELECT id FROM supplier_invoices WHERE supplier_id=%s)""",
+                (sid, sid))
+            cur.execute("DELETE FROM supplier_payments WHERE supplier_id = %s", (sid,))
+            cur.execute("DELETE FROM supplier_invoices WHERE supplier_id = %s", (sid,))
+            cur.execute("DELETE FROM suppliers WHERE id = %s", (sid,))
+    db.transaction(fn)
+    return {'success': True, 'invoicesDeleted': n['inv'], 'paymentsDeleted': n['pay']}
 
 
 # ---------------------------------------------------------------------------

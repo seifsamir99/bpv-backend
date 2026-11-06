@@ -340,7 +340,8 @@ def supplier_ledger_update_supplier(sid):
 @app.route('/api/supplier-ledger/suppliers/<int:sid>', methods=['DELETE'])
 def supplier_ledger_delete_supplier(sid):
     try:
-        return jsonify(supplier_ledger.delete_supplier(sid))
+        with_records = request.args.get('withRecords') in ('1', 'true')
+        return jsonify(supplier_ledger.delete_supplier(sid, with_records))
     except Exception as e:
         return _sl_fail(e)
 
