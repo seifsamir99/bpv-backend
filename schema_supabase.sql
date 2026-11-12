@@ -544,3 +544,16 @@ alter table employees add column if not exists crew_sheet_enabled boolean not nu
 -- the office types them into two boxes.
 alter table month_end add column if not exists sunday_ot_hours numeric not null default 0;
 alter table payroll   add column if not exists sunday_ot_hours numeric not null default 0;
+
+-- 2026-11-12: WPS roster (see wps_service.py). One row per line of a
+-- company's bank WPS file, uploaded once instead of every month. Text columns
+-- keep the leading zeros of MOL codes and account numbers.
+create table if not exists wps_roster (
+  mol_code     text primary key,          -- EMPMOLCODE
+  comp_mol     text not null,             -- COMPMOLCODE (Newell / Najmat Al Waad)
+  emp_name     text not null default '',  -- legal name as the bank has it
+  bank_code    text not null default '',
+  acc_no       text not null default '',
+  employee_id  text not null default '',  -- payroll employees.id; '' = not paired yet, '-' = not in payroll
+  sort_order   integer not null default 0 -- row order of the bank file
+);

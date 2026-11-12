@@ -24,6 +24,7 @@ import supplier_ledger_service as supplier_ledger
 import statement_extraction
 import lpo_records_service
 import job_order_records_service
+import wps_service
 import os
 import io
 import json
@@ -2680,6 +2681,41 @@ def get_payroll():
     if msg:
         return jsonify({'success': True, 'data': data, 'message': msg})
     return jsonify({'success': True, 'data': data, 'savedFromSheet': True})
+
+
+# ============================================================================
+# WPS ROSTER (bank salary-transfer file lines, per company)
+# ============================================================================
+
+@app.route('/api/wps/roster', methods=['GET'])
+def wps_get_roster():
+    try:
+        return jsonify({'success': True, 'data': wps_service.get_roster()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error(e)}), 500
+
+
+@app.route('/api/wps/roster/<comp_mol>', methods=['PUT'])
+def wps_replace_company(comp_mol):
+    """Body: {rows: [{molCode, name, bankCode, accNo, employeeId?}]} from an uploaded WPS file."""
+    try:
+        rows = (request.json or {}).get('rows') or []
+        count = wps_service.replace_company(comp_mol, rows)
+        return jsonify({'success': True, 'message': f'Saved {count} WPS lines'})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error(e)}), 500
+
+
+@app.route('/api/wps/pairings', methods=['POST'])
+def wps_save_pairings():
+    """Body: {pairings: {molCode: employeeId}}."""
+    try:
+        count = wps_service.save_pairings((request.json or {}).get('pairings') or {})
+        return jsonify({'success': True, 'updated': count})
+    except Exception as e:
+        return jsonify({'success': False, 'error': safe_error(e)}), 500
 
 
 if __name__ == "__main__":
