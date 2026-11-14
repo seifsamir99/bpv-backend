@@ -626,6 +626,23 @@ class EmployeeAttendanceService:
         cash_data = [r for r in data if r.get('isCash') or r.get('paymentMethod') == 'Cash']
         return len(data), len(cash_data), tab_name, month_abbr
 
+    def delete_payroll(self, month, year, emp_type):
+        """Remove one saved payroll run (month+type). month is 0-indexed like
+        the rest of the payroll API. Returns (rows deleted, month abbr)."""
+        month_abbr = MONTH_ABBRS[int(month)]
+        db_month = int(month) + 1
+        year = int(year)
+        emp_type = 'staff' if emp_type == 'staff' else 'labour'
+        counter = {'n': 0}
+
+        def fn(conn):
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM payroll WHERE year=%s AND month=%s AND emp_type=%s",
+                            (year, db_month, emp_type))
+                counter['n'] = cur.rowcount
+        db.transaction(fn)
+        return counter['n'], month_abbr
+
     def get_payroll_history(self):
         """All saved payroll runs, newest first: one row per (year, month, type)
         with employee count and totals. month returned 0-indexed like the rest

@@ -2665,6 +2665,20 @@ def write_payroll():
     return jsonify({'success': True, 'message': msg})
 
 
+@app.route('/api/payroll', methods=['DELETE'])
+def delete_payroll():
+    """Delete a whole saved payroll run: ?month=(0-indexed)&year=&type=labour|staff"""
+    month = request.args.get('month')
+    year = request.args.get('year')
+    emp_type = request.args.get('type')
+    if month is None or not year or emp_type not in ('labour', 'staff'):
+        return jsonify({'success': False, 'error': 'Missing required query params: month, year, type'}), 400
+    count, month_abbr = emp_service.delete_payroll(month, year, emp_type)
+    if not count:
+        return jsonify({'success': False, 'error': f'No saved {emp_type} payroll for {month_abbr} {year}'}), 404
+    return jsonify({'success': True, 'message': f'Deleted {count} {emp_type} payroll records for {month_abbr} {year}'})
+
+
 @app.route('/api/payroll/history', methods=['GET'])
 def get_payroll_history():
     return jsonify({'success': True, 'data': emp_service.get_payroll_history()})
