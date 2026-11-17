@@ -1241,6 +1241,225 @@ class PDFGenerator:
         doc.build(elements, onFirstPage=_draw_bg, onLaterPages=_draw_bg)
         return output_path
 
+    # -- client project documents (/projects page) -----------------------------
+    # Newell invoicing UPWARD to the main contractor. Layout matches the tax
+    # invoices already issued to Sumer (Google Doc), plus the advance-recovery
+    # row the client deducts. All figures arrive pre-computed from
+    # project_service; nothing here does money arithmetic.
+
+    def _client_doc(self, output_path):
+        """Letterhead page template + signature/stamp block, shared by the
+        client tax invoice and the statement of account."""
+        from PIL import Image as PILImage
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        assets = os.path.join(base_dir, 'assets')
+        if not os.path.isdir(assets):
+            assets = os.path.join(base_dir, '..', 'assets')
+        lh_full = os.path.join(assets, 'letterhead.jpg')
+        lh_hdr = os.path.join(assets, 'letterhead_header.jpg')
+        try:
+            with PILImage.open(lh_hdr) as img:
+                iw, ih = img.size
+            top = A4[0] * (ih / iw) + 14
+        except Exception:
+            top = 1.9 * inch
+        doc = SimpleDocTemplate(output_path, pagesize=A4, topMargin=top,
+                                bottomMargin=A4[1] * 0.10 + 6, leftMargin=20 * mm, rightMargin=20 * mm)
+        bg = lh_full if os.path.exists(lh_full) else lh_hdr
+
+        def draw_bg(canvas, _doc):
+            canvas.saveState()
+            canvas.drawImage(bg, 0, 0, width=A4[0], height=A4[1], preserveAspectRatio=False, mask='auto')
+            canvas.restoreState()
+
+        def signature_block(style):
+            cells = []
+            for name, h in (('hesham_signature_lpo.png', 16 * mm), ('company_stamp.png', 27 * mm)):
+                path = os.path.join(assets, name)
+                if os.path.exists(path):
+                    with PILImage.open(path) as img:
+                        w, hh = img.size
+                    cells.append(Image(path, width=h * w / hh, height=h))
+                else:
+                    cells.append(Spacer(1, h))
+            img_tbl = Table([cells], colWidths=[45 * mm, 35 * mm], hAlign='LEFT')
+            img_tbl.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'BOTTOM'),
+                                         ('LEFTPADDING', (0, 0), (-1, -1), 0)]))
+            return [img_tbl, Paragraph('Eng. Hesham Youssef', style), Paragraph('Managing Partner', style)]
+
+        # The frame keeps 6pt padding each side; a table exactly this wide lines
+        # up with the paragraphs instead of hanging past them.
+        return doc, draw_bg, signature_block, doc.width - 12
+
+    @staticmethod
+    def _client_date(iso):
+        """'2026-11-11' -> 'NOV 11th 2026', the style on the issued invoices."""
+        try:
+            d = datetime.strptime(str(iso)[:10], '%Y-%m-%d')
+        except Exception:
+            return str(iso or '')
+        suffix = 'th' if 11 <= d.day <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(d.day % 10, 'th')
+        return '%s %d%s %d' % (d.strftime('%b').upper(), d.day, suffix, d.year)
+
+    def generate_client_tax_invoice(self, payload, output_path):
+        """payload = project_service.invoice_pdf_payload()."""
+        inv, proj = payload['invoice'], payload['project']
+        doc, draw_bg, signature_block, W = self._client_doc(output_path)
+        money = lambda v: '{:,.2f}'.format(float(v or 0))
+        less = lambda v: '(%s)' % money(v)
+
+        b9 = ParagraphStyle('ci_b9', fontName='Helvetica-Bold', fontSize=9, leading=12)
+        b9r = ParagraphStyle('ci_b9r', parent=b9, alignment=TA_RIGHT)
+        b9c = ParagraphStyle('ci_b9c', parent=b9, alignment=TA_CENTER)
+        b8 = ParagraphStyle('ci_b8', fontName='Helvetica-Bold', fontSize=8, leading=10)
+        b8r = ParagraphStyle('ci_b8r', parent=b8, alignment=TA_RIGHT)
+        n8 = ParagraphStyle('ci_n8', fontName='Helvetica', fontSize=7.5, leading=10)
+        hd = ParagraphStyle('ci_hd', fontName='Helvetica-Bold', fontSize=6.5, leading=8, alignment=TA_CENTER)
+        reg = ParagraphStyle('ci_reg', fontName='Helvetica', fontSize=9, leading=12)
+
+        el = []
+        top = Table([[Paragraph('', b9), Paragraph('<u>TAX INVOICE -%s</u>' % inv['invoice_no'], b9c),
+                      Paragraph('Ref : %s' % inv['ref_number'], b9r)]], colWidths=[W * 0.3, W * 0.35, W * 0.35])
+        top.setStyle(TableStyle([('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+        el += [top, Paragraph(self._client_date(inv['invoice_date']), b9)]
+        trn = Table([[Paragraph('NEWELL TR: %s' % os.getenv('COMPANY_TRN', '100280024900003'), b9),
+                      Paragraph('TRN : %s' % (proj.get('client_trn') or ''), b9r)]], colWidths=[W / 2, W / 2])
+        trn.setStyle(TableStyle([('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+        el += [trn, Spacer(1, 10), Paragraph('To: %s' % proj['client'], b9), Spacer(1, 12),
+               Paragraph('<u>%s</u>' % (proj.get('invoice_title') or proj['name']), b9), Spacer(1, 10),
+               Paragraph('Please find the attached invoice as below for your action',
+                         ParagraphStyle('ci_i', parent=b8)), Spacer(1, 10)]
+
+        grid = [('GRID', (0, 0), (-1, -1), 0.75, colors.black), ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('TOPPADDING', (0, 0), (-1, -1), 3), ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                ('LEFTPADDING', (0, 0), (-1, -1), 3), ('RIGHTPADDING', (0, 0), (-1, -1), 3)]
+
+        if inv['kind'] == 'advance':
+            cw = [12 * mm, W - 12 * mm - 3 * 38 * mm, 38 * mm, 38 * mm, 38 * mm]
+            rows = [[Paragraph(h, hd) for h in ('SC.NO', 'ACTIVITY', 'TOTAL CONTRACT VALUE',
+                                                'ADVANCE', 'TOTAL RECEIVABLE')],
+                    [Paragraph('1', b8), Paragraph('MEP WORKS', b8), Paragraph(money(proj['contract_value']), b8r),
+                     Paragraph(money(inv['total_ex_vat']), b8r), Paragraph(money(inv['total_ex_vat']), b8r)],
+                    ['', Paragraph('VAT - %g %%' % proj['vat_pct'], b8), '', '', Paragraph(money(inv['vat']), b8r)],
+                    ['', Paragraph('PAYABLE AMOUNT WITH VAT', b8), '', '', Paragraph(money(inv['payable']), b8r)]]
+            t = Table(rows, colWidths=cw, rowHeights=[None, 12 * mm, None, None])
+            t.setStyle(TableStyle(grid + [('TOPPADDING', (0, 2), (-1, -1), 5),
+                                          ('BOTTOMPADDING', (0, 2), (-1, -1), 5)]))
+        else:
+            cw = [w * W / 170 for w in (8, 23, 22, 16, 16, 21, 21, 21, 22)]
+            head = ['S.N', 'ACTIVITY', 'Total Value', '% OF PREVIOUS WORK DONE', '% OF CURRENT WORK DONE',
+                    'CUMMULATIVE WORK', 'PREVIOUS WORK DONE', 'CURRENT WORK DONE', 'CUMMULATIVE WORK DONE']
+            rows = [[Paragraph(h, hd) for h in head],
+                    ['', Paragraph('TOTAL', b8), Paragraph(money(proj['contract_value']), b8),
+                     Paragraph('%.2f%%' % inv['prev_pct'], n8), Paragraph('%.2f%%' % inv['current_pct'], n8),
+                     Paragraph('%.2f%%' % inv['cumulative_pct'], n8), Paragraph(money(inv['prev_work']), n8),
+                     Paragraph(money(inv['current_work']), n8), Paragraph(money(inv['cumulative_work']), n8)]]
+            summary = [
+                ('GROSS VALUE OF WORK DONE', money(inv['cumulative_work'])),
+                ('AMOUNT CERTIFIED', money(inv['cumulative_work'])),
+                ('LESS ADVANCE RECOVERY (%g %%)' % proj['advance_recovery_pct'], less(inv['advance_recovery'])),
+                ('LESS RETENTION (%g %%)' % proj['retention_pct'], less(inv['retention'])),
+                ('DEDUCTIONS', less(0)),
+                ('PREVIOUS CERTIFIED PAID AMOUNT', less(inv['prev_certified'])),
+                ('TOTAL AMOUNT', money(inv['total_ex_vat'])),
+                ('VAT (%g%%)' % proj['vat_pct'], money(inv['vat'])),
+                ('PAYABLE AMOUNT WITH VAT', money(inv['payable'])),
+            ]
+            for label, value in summary:
+                rows.append(['', Paragraph(label, b8), '', '', '', '', '', '', Paragraph(value, b8r)])
+            t = Table(rows, colWidths=cw, rowHeights=[None, 13 * mm] + [None] * len(summary))
+            style = grid + [('VALIGN', (2, 1), (2, 1), 'MIDDLE'),
+                            ('TOPPADDING', (0, 2), (-1, -1), 5), ('BOTTOMPADDING', (0, 2), (-1, -1), 5)]
+            style += [('SPAN', (1, r), (2, r)) for r in range(2, len(rows))]
+            t.setStyle(TableStyle(style))
+        el += [t, Spacer(1, 6),
+               Paragraph('Amount in words: %s' % payload['amount_in_words'], b8), Spacer(1, 14)]
+        el += signature_block(reg)
+        doc.build(el, onFirstPage=draw_bg, onLaterPages=draw_bg)
+        return output_path
+
+    def generate_client_statement(self, payload, output_path):
+        """Statement of account / claim letter. payload = project_service.statement_payload()."""
+        proj, s = payload['project'], payload['summary']
+        doc, draw_bg, signature_block, W = self._client_doc(output_path)
+        money = lambda v: '{:,.2f}'.format(float(v or 0))
+        today = datetime.now()
+
+        b9 = ParagraphStyle('cs_b9', fontName='Helvetica-Bold', fontSize=9, leading=12)
+        b9r = ParagraphStyle('cs_b9r', parent=b9, alignment=TA_RIGHT)
+        reg = ParagraphStyle('cs_reg', fontName='Helvetica', fontSize=9, leading=13)
+        body = ParagraphStyle('cs_body', parent=reg, spaceAfter=8)
+        hd = ParagraphStyle('cs_hd', fontName='Helvetica-Bold', fontSize=8, leading=10, alignment=TA_CENTER)
+        c8 = ParagraphStyle('cs_c8', fontName='Helvetica', fontSize=8, leading=10)
+        r8 = ParagraphStyle('cs_r8', parent=c8, alignment=TA_RIGHT)
+        r8b = ParagraphStyle('cs_r8b', parent=r8, fontName='Helvetica-Bold')
+        c8b = ParagraphStyle('cs_c8b', parent=c8, fontName='Helvetica-Bold', alignment=TA_CENTER)
+
+        def pair(left, right):
+            t = Table([[Paragraph(left, b9), Paragraph(right, b9r)]], colWidths=[W / 2, W / 2])
+            t.setStyle(TableStyle([('LEFTPADDING', (0, 0), (-1, -1), 0), ('RIGHTPADDING', (0, 0), (-1, -1), 0)]))
+            return t
+
+        ref = 'NWEM/%s/SOA/%s' % (proj['code'], today.strftime('%d%m%Y'))
+        el = [pair(self._client_date(today.strftime('%Y-%m-%d')), 'Ref : %s' % ref),
+              pair('NEWELL TRN: %s' % os.getenv('COMPANY_TRN', '100280024900003'),
+                   'TRN : %s' % (proj.get('client_trn') or '')),
+              Spacer(1, 10), Paragraph('To: %s' % proj['client'], b9), Paragraph('DUBAI - U.A.E', b9),
+              Spacer(1, 10),
+              Paragraph('<u>Project: %s</u>' % (proj.get('invoice_title') or proj['name']), b9), Spacer(1, 4),
+              Paragraph('Subject: Statement of Account', b9), Spacer(1, 10),
+              Paragraph('Dear Sir,', body),
+              Paragraph('With reference to the above project, please find below the statement of our account, '
+                        'showing each tax invoice issued against your certification and the payments received.',
+                        body)]
+
+        def dmy(iso):
+            try:
+                return datetime.strptime(str(iso)[:10], '%Y-%m-%d').strftime('%d/%m/%Y')
+            except Exception:
+                return str(iso or '')
+
+        rows = [[Paragraph(h, hd) for h in ('Certificate', 'Our Tax Invoice', 'Invoiced (incl. VAT)',
+                                            'Payments Received', 'Balance Due')]]
+        for inv in payload['invoices']:
+            paid = '<br/>'.join('%s&nbsp;&nbsp;(%s%s)' % (
+                money(r['amount']), ('Chq %s, ' % r['cheque_no']) if r['cheque_no'] else 'Received ',
+                dmy(r['receipt_date'])) for r in inv['receipts']) or '-'
+            rows.append([Paragraph(inv['client_pc'] or inv['kind'].capitalize(), c8b),
+                         Paragraph('Tax Invoice %s<br/>%s' % (inv['invoice_no'], dmy(inv['invoice_date'])), c8),
+                         Paragraph(money(inv['payable']), r8), Paragraph(paid, r8),
+                         Paragraph(money(inv['balance']), r8b if inv['balance'] else r8)])
+        unalloc = payload.get('unallocated_receipts') or []
+        if unalloc:
+            rows.append([Paragraph('On account', c8b), '', '',
+                         Paragraph('<br/>'.join('%s&nbsp;&nbsp;(%s)' % (money(r['amount']), dmy(r['receipt_date']))
+                                                for r in unalloc), r8),
+                         Paragraph('(%s)' % money(sum(r['amount'] for r in unalloc)), r8)])
+        rows.append([Paragraph('TOTAL', c8b), '', Paragraph(money(s['invoiced']), r8b),
+                     Paragraph(money(s['received']), r8b), Paragraph(money(s['owed_by_client']), r8b)])
+        t = Table(rows, colWidths=[22 * mm, 32 * mm, 30 * mm, W - 114 * mm, 30 * mm], repeatRows=1)
+        t.setStyle(TableStyle([('GRID', (0, 0), (-1, -1), 0.75, colors.black),
+                               ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                               ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#EFEFEF'))]))
+        el += [t, Spacer(1, 10)]
+
+        owed = s['owed_by_client']
+        if owed > 0.005:
+            el.append(Paragraph('As per the above, an amount of <b>AED %s</b> (%s) remains outstanding. We kindly '
+                                'request you to arrange the release of this balance at your earliest convenience.'
+                                % (money(owed), payload['balance_in_words']), body))
+        else:
+            el.append(Paragraph('As per the above, the invoices issued to date are fully settled.', body))
+        if s['retention_held']:
+            el.append(Paragraph('For your information, retention held to date amounts to AED %s (%g%% of the '
+                                'cumulative certified value of AED %s), which is due for release as per the '
+                                'terms of the contract.' % (money(s['retention_held']), proj['retention_pct'],
+                                                            money(s['certified_to_date'])), body))
+        el += [Spacer(1, 6), Paragraph('Thanking you,', reg), Spacer(1, 4)]
+        el += signature_block(reg)
+        doc.build(el, onFirstPage=draw_bg, onLaterPages=draw_bg)
+        return output_path
+
     def generate_hr_letter(self, letter_data, output_path):
         """Generate an HR salary/employment certificate on company letterhead"""
         import arabic_reshaper

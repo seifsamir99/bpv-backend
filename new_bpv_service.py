@@ -125,12 +125,14 @@ class NewBPVService:
                 cur.execute(
                     """INSERT INTO bpv_line_items
                        (bpv_no, date, type, sr_no, description, company,
-                        cheque_no, cheque_date, debit, credit)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        cheque_no, cheque_date, debit, credit, project_code)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (bpv_no, date, pdc_type, str(item.get('srNo', '')),
                      item.get('description', ''), item.get('companyName', ''),
                      str(item.get('chequeNo', '')), item.get('chequeDate', ''),
-                     _to_float(item.get('debit', 0)), _to_float(item.get('credit', 0))))
+                     _to_float(item.get('debit', 0)), _to_float(item.get('credit', 0)),
+                     # /projects counts a tagged line without review
+                     (item.get('projectCode') or '').strip() or None))
 
     def _constructed_voucher(self, data):
         bpv_no = str(data.get('bpvNo', '')).strip()
@@ -171,6 +173,7 @@ class NewBPVService:
                 'chequeDate': row.get('cheque_date', ''),
                 'debit': _to_float(row.get('debit', 0)),
                 'credit': _to_float(row.get('credit', 0)),
+                'projectCode': row.get('project_code') or '',
             }
             vouchers_map[bpv_no]['lineItems'].append(item)
             vouchers_map[bpv_no]['totalAmount'] += item['debit']

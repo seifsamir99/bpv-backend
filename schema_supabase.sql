@@ -21,7 +21,8 @@ create table if not exists bpv_line_items (
   cheque_no   text not null default '',
   cheque_date text not null default '',
   debit       numeric not null default 0,
-  credit      numeric not null default 0
+  credit      numeric not null default 0,
+  project_code text                          -- /projects site tag (e.g. 'S108'); tagged lines count without review
 );
 create index if not exists idx_bpv_line_items_bpv_no on bpv_line_items (bpv_no);
 
@@ -556,4 +557,77 @@ create table if not exists wps_roster (
   acc_no       text not null default '',
   employee_id  text not null default '',  -- payroll employees.id; '' = not paired yet, '-' = not in payroll
   sort_order   integer not null default 0 -- row order of the bank file
+);
+
+-- Client projects (/projects page): a site's balance sheet. Newell is the MEP
+-- subcontractor; the client certifies work and Newell invoices UPWARD.
+-- Created by migrate_projects.py (which also seeds S108 Warsan / Sumer).
+create table if not exists projects (
+  id                   bigint generated always as identity primary key,
+  code                 text not null unique,            -- 'S108'
+  name                 text not null,
+  client               text not null,
+  client_trn           text not null default '',
+  invoice_title        text not null default '',        -- project line printed on invoices
+  contract_value       numeric(14,2) not null,          -- NET of VAT
+  advance_recovery_pct numeric(5,2) not null default 10,
+  retention_pct        numeric(5,2) not null default 10,
+  vat_pct              numeric(5,2) not null default 5,
+  match_terms          text[] not null default '{}',    -- words that suggest a cost belongs here
+  archived             boolean not null default false,
+  created_at           timestamptz not null default now()
+);
+
+-- Every derived figure stored at issue (like payment_certificates): a reprint
+-- shows what went out. Only the latest invoice may be deleted.
+create table if not exists project_invoices (
+  id                 bigint generated always as identity primary key,
+  project_id         bigint not null references projects(id) on delete cascade,
+  invoice_no         text not null,
+  ref_number         text not null default '',
+  invoice_date       date not null,
+  kind               text not null default 'interim',   -- advance | interim | final
+  client_pc          text not null default '',
+  cumulative_work    numeric(14,2) not null default 0,  -- the one figure typed: client's cumulative certified work
+  prev_work          numeric(14,2) not null default 0,
+  current_work       numeric(14,2) not null default 0,
+  prev_pct           numeric(7,2)  not null default 0,
+  current_pct        numeric(7,2)  not null default 0,
+  cumulative_pct     numeric(7,2)  not null default 0,
+  advance_recovery   numeric(14,2) not null default 0,
+  retention          numeric(14,2) not null default 0,
+  prev_certified     numeric(14,2) not null default 0,
+  total_ex_vat       numeric(14,2) not null,
+  vat                numeric(14,2) not null,
+  payable            numeric(14,2) not null,
+  note               text not null default '',
+  created_at         timestamptz not null default now(),
+  unique (project_id, invoice_no)
+);
+create index if not exists project_invoices_project_idx on project_invoices (project_id, invoice_date);
+
+create table if not exists project_receipts (
+  id           bigint generated always as identity primary key,
+  project_id   bigint not null references projects(id) on delete cascade,
+  invoice_id   bigint references project_invoices(id) on delete set null,
+  receipt_date date not null,
+  cheque_no    text not null default '',
+  bank         text not null default '',
+  amount       numeric(14,2) not null,
+  note         text not null default '',
+  created_at   timestamptz not null default now()
+);
+create index if not exists project_receipts_project_idx on project_receipts (project_id, receipt_date);
+
+-- The user's decision on each suggested cost. BPV keys are 'bpv_no|cheque_no|debit'
+-- because BPV edits delete and re-insert lines (ids are not stable); a changed
+-- line simply returns to review.
+create table if not exists project_cost_links (
+  id          bigint generated always as identity primary key,
+  project_id  bigint not null references projects(id) on delete cascade,
+  source      text not null,          -- bpv | lpo | job_order
+  source_key  text not null,
+  status      text not null,          -- included | excluded | security
+  decided_at  timestamptz not null default now(),
+  unique (project_id, source, source_key)
 );

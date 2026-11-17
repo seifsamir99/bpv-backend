@@ -21,6 +21,7 @@ from email_notifications import EmailNotifier
 import credit_form_service as credit_form
 import payment_cert_service as payment_cert
 import supplier_ledger_service as supplier_ledger
+import project_service as project_svc
 import statement_extraction
 import lpo_records_service
 import job_order_records_service
@@ -1701,6 +1702,138 @@ def payment_cert_pdf(pid):
                          download_name=f"{name}.pdf")
     except Exception as e:
         return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+# ============================================================================
+# CLIENT PROJECTS (/projects page) -- a site's balance sheet: contract, what the
+# client certified/paid (invoices Newell issues UPWARD), and what was spent on
+# the site (BPV payments the user confirmed, LPOs/job orders as "ordered").
+# All arithmetic and cost matching lives in project_service.
+# ============================================================================
+
+def _proj_fail(exc, status=400):
+    if isinstance(exc, project_svc.ProjectError):
+        return jsonify({"success": False, "error": str(exc)}), status
+    return jsonify({"success": False, "error": safe_error(exc)}), 500
+
+
+@app.route('/api/projects', methods=['GET'])
+def projects_list():
+    try:
+        include = request.args.get('archived', '') in ('1', 'true', 'yes')
+        return jsonify({"success": True, "projects": project_svc.list_projects(include_archived=include)})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects', methods=['POST'])
+def projects_create():
+    try:
+        return jsonify({"success": True, "project": project_svc.create_project(request.json or {})})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/<int:pid>', methods=['PUT'])
+def projects_update(pid):
+    try:
+        return jsonify({"success": True, "project": project_svc.update_project(pid, request.json or {})})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/<int:pid>/overview', methods=['GET'])
+def projects_overview(pid):
+    """Everything the page shows for one project, in one round-trip."""
+    try:
+        return jsonify({"success": True, **project_svc.overview(pid)})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/<int:pid>/invoices/preview', methods=['POST'])
+def projects_invoice_preview(pid):
+    try:
+        return jsonify({"success": True, "preview": project_svc.preview_invoice(pid, request.json or {})})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/<int:pid>/invoices', methods=['POST'])
+def projects_invoice_save(pid):
+    try:
+        return jsonify({"success": True, "invoice": project_svc.save_invoice(pid, request.json or {})})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/invoices/<int:iid>', methods=['DELETE'])
+def projects_invoice_delete(iid):
+    try:
+        project_svc.delete_invoice(iid)
+        return jsonify({"success": True})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+def _send_project_pdf(build, name):
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        pdf_path = tmp.name
+    try:
+        build(pdf_path)
+        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True,
+                         download_name=name.replace('/', '-').replace(' ', '') + '.pdf')
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/projects/invoices/<int:iid>/pdf', methods=['GET'])
+def projects_invoice_pdf(iid):
+    try:
+        payload = project_svc.invoice_pdf_payload(iid)
+    except Exception as e:
+        return _proj_fail(e)
+    inv = payload['invoice']
+    return _send_project_pdf(lambda p: pdf_gen.generate_client_tax_invoice(payload, p),
+                             'Tax Invoice %s - %s' % (inv['invoice_no'], payload['project']['code']))
+
+
+@app.route('/api/projects/<int:pid>/statement/pdf', methods=['GET'])
+def projects_statement_pdf(pid):
+    try:
+        payload = project_svc.statement_payload(pid)
+    except Exception as e:
+        return _proj_fail(e)
+    return _send_project_pdf(lambda p: pdf_gen.generate_client_statement(payload, p),
+                             'Statement of Account - %s - %s' % (payload['project']['code'],
+                                                                 datetime.now().strftime('%d-%m-%Y')))
+
+
+@app.route('/api/projects/<int:pid>/receipts', methods=['POST'])
+def projects_receipt_add(pid):
+    try:
+        return jsonify({"success": True, "receipt": project_svc.add_receipt(pid, request.json or {})})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/receipts/<int:rid>', methods=['DELETE'])
+def projects_receipt_delete(rid):
+    try:
+        project_svc.delete_receipt(rid)
+        return jsonify({"success": True})
+    except Exception as e:
+        return _proj_fail(e)
+
+
+@app.route('/api/projects/<int:pid>/costs/decide', methods=['POST'])
+def projects_costs_decide(pid):
+    """Body: {items: [{source, key, status}]}; status '' sends a line back to review."""
+    try:
+        n = project_svc.decide(pid, (request.json or {}).get('items') or [])
+        return jsonify({"success": True, "updated": n})
+    except Exception as e:
+        return _proj_fail(e)
 
 
 # ============================================================================
