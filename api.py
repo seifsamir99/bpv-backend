@@ -3,6 +3,7 @@ Flask API for Purchase & Accounting System
 Provides REST endpoints for frontend to interact with Google Sheets backend
 """
 
+import re
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
@@ -819,13 +820,33 @@ def _lpo_write_json(filename, data):
     pgdb.transaction(fn)
 
 
+_LPO_NUM_RE = re.compile(r'^\s*LPO-\d{4}-(\d+)\s*$', re.IGNORECASE)
+
+
+def _lpo_serial(lpo_number):
+    """Trailing serial of 'LPO-2026-1830' -> 1830; None for anything else."""
+    m = _LPO_NUM_RE.match(str(lpo_number or ''))
+    return int(m.group(1)) if m else None
+
+
 @app.route('/api/lpo-gen/next-number', methods=['GET'])
 def lpo_gen_next_number():
-    """Get next LPO number suggestion"""
-    counter = _lpo_read_json('counter.json', {'current': 1001})
+    """Next LPO number = one past the highest LPO in History (or the counter,
+    whichever is higher). Numbers are often typed by hand to continue the paper
+    series, so the counter alone falls behind; History is the real record."""
+    counter = _lpo_read_json('counter.json', {'current': 1001})['current']
+    try:
+        row = pgdb.q_one(
+            r"""SELECT MAX(substring(lpo_number from '(\d+)\s*$')::int) AS n
+                  FROM lpo_records
+                 WHERE lpo_number ~* '^\s*LPO-\d{4}-\d+\s*$'""")
+        if row and row['n'] is not None:
+            counter = max(counter, row['n'] + 1)
+    except Exception as e:
+        app.logger.error("LPO next-number history lookup failed: %s", e)
     year = datetime.now().year
-    lpo_number = f"LPO-{year}-{counter['current']:04d}"
-    return jsonify({"success": True, "lpo_number": lpo_number, "counter": counter['current']})
+    lpo_number = f"LPO-{year}-{counter:04d}"
+    return jsonify({"success": True, "lpo_number": lpo_number, "counter": counter})
 
 
 @app.route('/api/lpo-gen/sites', methods=['GET'])
@@ -1114,17 +1135,15 @@ def lpo_gen_pdf():
         except Exception as e:
             app.logger.error("LPO history record save failed: %s", e, exc_info=True)
 
-        # Bump counter if LPO number matches auto-generated format
+        # Move the counter past whatever number was used, typed or suggested.
+        # GREATEST makes it atomic and one-way: it never goes backwards, so
+        # re-issuing an old number can't rewind it.
         try:
-            counter = _lpo_read_json('counter.json', {'current': 1001})
-            year = datetime.now().year
-            expected = f"LPO-{year}-{counter['current']:04d}"
-            if lpo_number == expected:
-                # Conditional increment: atomic, so two concurrent PDF
-                # generations can never skip or reuse a number.
+            serial = _lpo_serial(lpo_number)
+            if serial is not None:
                 pgdb.execute(
-                    "UPDATE lpo_counter SET value = value + 1 WHERE id = 1 AND value = %s",
-                    (counter['current'],))
+                    "UPDATE lpo_counter SET value = GREATEST(value, %s) WHERE id = 1",
+                    (serial + 1,))
         except Exception:
             pass
 
