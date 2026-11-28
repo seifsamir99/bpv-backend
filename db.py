@@ -47,6 +47,28 @@ load_dotenv()
 _pool = None
 _pool_lock = threading.Lock()
 
+# read_only(): per-thread flag; while set, every connection checked out on this
+# thread runs its work inside a READ ONLY transaction (see get_conn).
+_local = threading.local()
+
+
+@contextmanager
+def read_only():
+    """Make every query on this thread read-only, enforced by Postgres.
+
+    Used by the Newell Assistant's data tools (assistant_data_tools.py): they
+    call the normal service functions, and some of those write as a side effect
+    (get_attendance seeds a month's rows). Inside this block any INSERT,
+    UPDATE or DELETE fails with "cannot execute ... in a read-only transaction"
+    instead of touching the books.
+    """
+    previous = getattr(_local, 'read_only', False)
+    _local.read_only = True
+    try:
+        yield
+    finally:
+        _local.read_only = previous
+
 # Kept in one place: _with_retry needs to know how many dead connections it
 # might have to chew through before the pool hands out a fresh one.
 _POOL_SIZE = 8
@@ -128,8 +150,17 @@ def get_conn(transactional=True):
     pool = _get_pool()
     conn = pool.getconn()
     broken = False
+    # Under read_only() the work always runs in a transaction, opened READ ONLY
+    # (transaction-scoped, so nothing leaks to the next user of the pooled
+    # connection -- a session-level setting would, under Supavisor).
+    guarded = getattr(_local, 'read_only', False)
+    if guarded:
+        transactional = True
     try:
         conn.autocommit = not transactional
+        if guarded:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
         yield conn
         if transactional:
             conn.commit()

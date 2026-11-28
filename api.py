@@ -4,7 +4,7 @@ Provides REST endpoints for frontend to interact with Google Sheets backend
 """
 
 import re
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from googleapiclient.errors import HttpError
@@ -27,6 +27,13 @@ import statement_extraction
 import lpo_records_service
 import job_order_records_service
 import wps_service
+import accounting_assistant
+import assistant_engine
+import assistant_chat_service as assistant_chat
+import assistant_documents
+import assistant_knowledge_service as assistant_knowledge
+import assistant_updater
+import queue
 import os
 import io
 import json
@@ -2147,15 +2154,15 @@ def _chat_build_context():
 
 @app.route('/api/chat', methods=['POST'])
 def ai_chat():
-    """AI chat assistant over live system data (BPV, PDC/CDC, employees).
+    """Newell Assistant widget: quick questions, not saved (assistant_engine.py).
 
-    Engine: Claude (claude-opus-4-6, per CLAUDE.md) when a real
-    ANTHROPIC_API_KEY is set; otherwise OpenAI; otherwise a friendly
-    not-configured message.
+    Same engine as the /assistant page (knowledge base + official-site search +
+    calculate + self-check), without streaming. OpenAI with the knowledge base
+    only as a fallback; otherwise a friendly not-configured message.
     """
     try:
-        data = request.json
-        user_message = data.get('message', '')
+        data = request.json or {}
+        user_message = str(data.get('message', '')).strip()
         history = data.get('history', [])
 
         if not user_message:
@@ -2170,62 +2177,311 @@ def ai_chat():
                 "error": "AI assistant is not configured yet — no AI API key is set on the server."
             })
 
-        system_prompt = (
-            "You are the AI assistant for Newell Electromechanical Works LLC's "
-            "accounting system (Bank Payment Vouchers, PDC/CDC cheques, employees, "
-            "payroll). Answer concisely using the live data below. If the data "
-            "doesn't cover the question, say so instead of guessing.\n\n"
-            + _chat_build_context()
-        )
-
-        messages = []
-        for msg in history:
-            role = msg.get('role')
-            content = str(msg.get('content', '')).strip()
-            if role in ('user', 'assistant') and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": user_message})
-
-        def ask_claude():
-            from anthropic import Anthropic
-            client = Anthropic(api_key=anthropic_key)
-            response = client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1024,
-                system=system_prompt,
-                messages=messages,
-            )
-            return next((b.text for b in response.content if b.type == "text"), "")
+        live_context = _chat_build_context()
 
         def ask_openai():
             from openai import OpenAI
             client = OpenAI(api_key=openai_key)
-            response = client.chat.completions.create(
-                model="gpt-4o",
-                max_tokens=500,
-                messages=[{"role": "system", "content": system_prompt}] + messages,
-            )
-            return response.choices[0].message.content
+            messages = [{"role": "system", "content": accounting_assistant.plain_system_prompt(live_context)}]
+            messages += accounting_assistant.clean_history(history)
+            messages.append({"role": "user", "content": user_message})
+            response = client.chat.completions.create(model="gpt-4o", max_tokens=2000, messages=messages)
+            return {"response": response.choices[0].message.content, "sources": [], "check": None}
 
         if use_claude:
             try:
-                ai_response = ask_claude()
+                result = assistant_engine.answer(
+                    accounting_assistant.clean_history(history),
+                    [{"type": "text", "text": user_message}],
+                    live_context,
+                    api_key=anthropic_key,
+                )
             except Exception:
                 if not openai_key:
                     raise
                 app.logger.warning("Claude chat failed; falling back to OpenAI", exc_info=True)
-                ai_response = ask_openai()
+                result = ask_openai()
         else:
-            ai_response = ask_openai()
+            result = ask_openai()
 
-        return jsonify({"success": True, "response": ai_response})
+        return jsonify({"success": True, "response": result["response"], "sources": result["sources"],
+                        "check": result.get("check")})
 
     except Exception as e:
+        app.logger.exception("chat failed")
         return jsonify({
             "success": False,
             "error": safe_error(e),
             "response": "Sorry, the AI assistant hit a problem answering that. Please try again."
         })
+
+
+# ============================================================================
+# NEWELL ASSISTANT CHAT PAGE (/assistant): saved conversations, files, and a
+# streamed answer (Server-Sent Events). Engine: assistant_engine.py.
+# ============================================================================
+
+def _assistant_fail(e):
+    if isinstance(e, assistant_chat.Busy):
+        return jsonify({"success": False, "error": str(e)}), 409
+    if isinstance(e, assistant_chat.ChatError):
+        return jsonify({"success": False, "error": str(e)}), 400
+    return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/assistant/conversations', methods=['GET'])
+def assistant_list_conversations():
+    try:
+        return jsonify({"success": True, "conversations": assistant_chat.list_conversations()})
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+@app.route('/api/assistant/conversations', methods=['POST'])
+def assistant_create_conversation():
+    try:
+        conv = assistant_chat.create_conversation((request.json or {}).get('title'))
+        return jsonify({"success": True, "conversation": conv})
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+@app.route('/api/assistant/conversations/<int:conversation_id>', methods=['GET'])
+def assistant_get_conversation(conversation_id):
+    try:
+        return jsonify({"success": True, **assistant_chat.get_conversation(conversation_id)})
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+@app.route('/api/assistant/conversations/<int:conversation_id>', methods=['PATCH'])
+def assistant_rename_conversation(conversation_id):
+    try:
+        conv = assistant_chat.rename_conversation(conversation_id, (request.json or {}).get('title'))
+        return jsonify({"success": True, "conversation": conv})
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+@app.route('/api/assistant/conversations/<int:conversation_id>', methods=['DELETE'])
+def assistant_delete_conversation(conversation_id):
+    try:
+        assistant_chat.delete_conversation(conversation_id)
+        return jsonify({"success": True})
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+@app.route('/api/assistant/conversations/<int:conversation_id>/files', methods=['POST'])
+def assistant_upload_file(conversation_id):
+    """Multipart: file, plus text_content for Excel (converted to CSV in the browser)."""
+    try:
+        upload = request.files.get('file')
+        if not upload:
+            return jsonify({"success": False, "error": "No file uploaded"}), 400
+        data = upload.read(assistant_chat.MAX_FILE_BYTES + 1)
+        meta = assistant_chat.save_file(conversation_id, upload.filename, upload.mimetype, data,
+                                        request.form.get('text_content'))
+        return jsonify({"success": True, "file": meta})
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+@app.route('/api/assistant/files/<int:file_id>', methods=['GET'])
+def assistant_download_file(file_id):
+    try:
+        f = assistant_chat.get_file(file_id)
+        return send_file(io.BytesIO(f["data"]), mimetype=f["mime"], download_name=f["filename"],
+                         as_attachment=request.args.get('download') == '1')
+    except Exception as e:
+        return _assistant_fail(e)
+
+
+def _sse(event):
+    return f"data: {json.dumps(event, default=str)}\n\n"
+
+
+def _assistant_error_text(e):
+    import anthropic
+    if isinstance(e, (anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APIConnectionError)):
+        return "The AI service is busy or unreachable right now. Please try again in a minute."
+    return "Sorry, I hit a problem answering that. Please try again."
+
+
+def _assistant_save_documents(conversation_id, specs, emit):
+    """Render the answer's drafted documents (Word + PDF) and save them to the chat.
+    Returns (file ids, a note for the reply naming any document that failed)."""
+    ids, failed = [], []
+    if specs:
+        emit({"type": "status", "text": "Making the Word and PDF files…"})
+    for spec in specs or []:
+        try:
+            for filename, mime, data in assistant_documents.render(spec):
+                source = assistant_documents.as_text(spec) if filename.endswith('.docx') else None
+                ids.append(assistant_chat.save_generated(conversation_id, filename, mime, data, source)["id"])
+        except Exception:
+            app.logger.exception("assistant document render failed (conversation %s)", conversation_id)
+            failed.append(spec.get("title") or "the document")
+    note = "".join(f"\n\n_(Couldn't make the files for \"{t}\". Ask me to make it again.)_" for t in failed)
+    return ids, note
+
+
+@app.route('/api/assistant/conversations/<int:conversation_id>/messages', methods=['POST'])
+def assistant_send_message(conversation_id):
+    """Ask a question. Streams Server-Sent Events, each `data: {json}`:
+      user    {message}          the saved question
+      status  {text}             "Searching official sites: ...", "Checking the answer..."
+      delta   {text}             answer text as it is written
+      reset   {}                 clear the streamed text (a corrected answer follows)
+      final   {message}          the saved answer, with sources and check result
+      error   {error, message}   the answer failed (message is the saved error reply)
+    The answer runs in its own thread, so it is saved even if the browser leaves.
+    """
+    data = request.json or {}
+    content = str(data.get('content', '')).strip()
+    api_key = os.getenv('ANTHROPIC_API_KEY', '')
+    try:
+        if not api_key.startswith('sk-ant-'):
+            raise assistant_chat.ChatError("The assistant isn't configured: no Anthropic API key on the server.")
+        file_ids = assistant_chat.check_file_ids(conversation_id, data.get('file_ids'))
+        if not content and not file_ids:
+            raise assistant_chat.ChatError("Type a question or attach a file")
+        if len(content) > 20000:
+            raise assistant_chat.ChatError("That message is too long. Attach long text as a file instead.")
+    except Exception as e:
+        return _assistant_fail(e)
+
+    if not assistant_chat.try_start(conversation_id):
+        return jsonify({"success": False, "error": "Still answering the last question in this chat"}), 409
+    try:
+        history, turn = assistant_chat.build_turns(conversation_id, file_ids, content)
+        user_msg = assistant_chat.add_message(conversation_id, 'user', content, file_ids=file_ids)
+    except Exception as e:
+        assistant_chat.finish(conversation_id)
+        return _assistant_fail(e)
+
+    events = queue.Queue()
+
+    def work():
+        try:
+            result = assistant_engine.answer(history, turn, _chat_build_context(), emit=events.put,
+                                             api_key=api_key, documents=True)
+            doc_ids, note = _assistant_save_documents(conversation_id, result.get("documents"), events.put)
+            saved = assistant_chat.add_message(conversation_id, 'assistant', result["response"] + note,
+                                               file_ids=doc_ids, sources=result["sources"], check=result["check"])
+            events.put({"type": "final", "message": saved})
+        except Exception as e:
+            app.logger.exception("assistant answer failed (conversation %s)", conversation_id)
+            text = _assistant_error_text(e)
+            try:
+                saved = assistant_chat.add_message(conversation_id, 'assistant', text, error=True)
+            except Exception:
+                app.logger.exception("could not save the assistant error reply")
+                saved = None
+            events.put({"type": "error", "error": text, "message": saved})
+        finally:
+            assistant_chat.finish(conversation_id)
+            events.put(None)
+
+    threading.Thread(target=work, daemon=True, name=f"assistant-{conversation_id}").start()
+
+    def stream():
+        yield _sse({"type": "user", "message": user_msg})
+        while True:
+            try:
+                event = events.get(timeout=15)
+            except queue.Empty:
+                yield ": keep-alive\n\n"  # keeps proxies from closing a quiet stream
+                continue
+            if event is None:
+                return
+            yield _sse(event)
+
+    return Response(stream(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+
+# ============================================================================
+# ASSISTANT SELF-UPDATE (library + knowledge base; assistant_updater.py)
+# ============================================================================
+
+@app.route('/api/assistant/updates', methods=['GET'])
+def assistant_update_status():
+    try:
+        return jsonify({"success": True, **assistant_updater.status()})
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/assistant/updates/run', methods=['POST'])
+def assistant_update_run():
+    """'Check now': start a run in the background (409 if one is running)."""
+    try:
+        if not os.getenv('ANTHROPIC_API_KEY', '').startswith('sk-ant-'):
+            return jsonify({"success": False, "error": "No Anthropic API key on the server"}), 400
+        run_id = assistant_updater.run_in_background("manual")
+        if not run_id:
+            return jsonify({"success": False, "error": "An update is already running"}), 409
+        return jsonify({"success": True, "runId": run_id})
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/assistant/updates/changes/<int:change_id>/undo', methods=['POST'])
+def assistant_update_undo(change_id):
+    try:
+        assistant_updater.undo(change_id)
+        return jsonify({"success": True})
+    except (assistant_updater.UpdateError, assistant_knowledge.KnowledgeError) as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+# ============================================================================
+# ASSISTANT KNOWLEDGE BASE (/assistant-knowledge page)
+# ============================================================================
+
+@app.route('/api/assistant-knowledge', methods=['GET'])
+def list_assistant_knowledge():
+    try:
+        return jsonify({"success": True, **assistant_knowledge.list_entries()})
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/assistant-knowledge', methods=['POST'])
+def create_assistant_knowledge():
+    try:
+        entry = assistant_knowledge.create_entry(request.json or {})
+        return jsonify({"success": True, "entry": entry})
+    except assistant_knowledge.KnowledgeError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/assistant-knowledge/<int:entry_id>', methods=['PUT'])
+def update_assistant_knowledge(entry_id):
+    try:
+        entry = assistant_knowledge.update_entry(entry_id, request.json or {})
+        return jsonify({"success": True, "entry": entry})
+    except assistant_knowledge.KnowledgeError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
+
+
+@app.route('/api/assistant-knowledge/<int:entry_id>', methods=['DELETE'])
+def delete_assistant_knowledge(entry_id):
+    try:
+        assistant_knowledge.delete_entry(entry_id)
+        return jsonify({"success": True})
+    except assistant_knowledge.KnowledgeError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": safe_error(e)}), 500
 
 
 # ============================================================================
@@ -2905,6 +3161,11 @@ if __name__ == "__main__":
             time.sleep(300)
 
     threading.Thread(target=_auto_absent_loop, daemon=True).start()
+
+    # Newell Assistant self-update: library + knowledge base, every
+    # ASSISTANT_UPDATE_DAYS (default 14). On only on Railway or with
+    # ASSISTANT_AUTO_UPDATE=1 (assistant_updater.py).
+    assistant_updater.start_scheduler()
 
     # threaded=True: without it the dev server handles ONE request at a time —
     # a slow payroll save blocked every other request (hung history panel,

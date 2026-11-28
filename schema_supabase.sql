@@ -631,3 +631,145 @@ create table if not exists project_cost_links (
   decided_at  timestamptz not null default now(),
   unique (project_id, source, source_key)
 );
+
+-- ============================================================================
+-- Newell Assistant knowledge base (/assistant-knowledge page; read by
+-- accounting_assistant.py on every chat question). One row per section.
+-- Created/seeded by execution/migrate_assistant_knowledge.py.
+-- ============================================================================
+create table if not exists assistant_knowledge (
+  id            serial primary key,
+  topic         text not null,
+  title         text not null,
+  body          text not null default '',      -- markdown
+  sources       text not null default '',
+  last_verified date,
+  sort_order    int  not null default 0,
+  active        boolean not null default true,  -- inactive rows are hidden from the assistant
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  unique (topic, title)
+);
+
+-- ============================================================================
+-- Newell Assistant chat page (/assistant). Saved conversations, every message
+-- (with the answer's sources and self-check result) and uploaded files.
+-- Created by execution/migrate_assistant_chat.py. The office app has no login,
+-- so these are shared like all other app data.
+-- ============================================================================
+create table if not exists assistant_conversations (
+  id          serial primary key,
+  title       text not null default 'New chat',
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create table if not exists assistant_files (
+  id               serial primary key,
+  conversation_id  int not null references assistant_conversations(id) on delete cascade,
+  filename         text not null,
+  mime             text not null,
+  size_bytes       int  not null,
+  data             bytea not null,       -- the original upload (images may be downscaled)
+  text_content     text,                 -- CSV / Excel (converted in the browser) / Word text
+  created_at       timestamptz not null default now()
+);
+
+create table if not exists assistant_messages (
+  id               serial primary key,
+  conversation_id  int not null references assistant_conversations(id) on delete cascade,
+  role             text not null check (role in ('user', 'assistant')),
+  content          text not null default '',          -- markdown as shown
+  sources          jsonb not null default '[]'::jsonb, -- [{title, url}]
+  check_result     jsonb,                              -- {status, confirmed, changes[]}
+  file_ids         jsonb not null default '[]'::jsonb, -- assistant_files ids attached to a user message
+  error            boolean not null default false,     -- a failed answer; skipped when re-sending history
+  created_at       timestamptz not null default now()
+);
+
+create index if not exists assistant_messages_conv_idx on assistant_messages (conversation_id, id);
+create index if not exists assistant_files_conv_idx on assistant_files (conversation_id);
+create index if not exists assistant_conversations_updated_idx on assistant_conversations (updated_at desc);
+
+-- ============================================================================
+-- Newell Assistant library: the official UAE tax and labour documents
+-- (laws, executive regulations, Cabinet/Ministerial/FTA decisions, FTA guides,
+-- public clarifications, EmaraTax manuals), split by article / section and
+-- full-text indexed. Created by execution/migrate_assistant_library.py, filled
+-- by execution/build_library.py, searched by library_service.py.
+-- ============================================================================
+create table if not exists library_documents (
+  id            serial primary key,
+  source        text not null,                  -- site, e.g. tax.gov.ae
+  listing       text not null,                  -- listing page it came from, or 'manual'
+  url           text not null unique,           -- the official PDF (may end in #page=N)
+  title         text not null,
+  category      text not null default '',       -- VAT | Corporate Tax | Tax Procedures | Labour
+  doc_type      text not null default '',       -- law | regulation | cabinet_decision | ministerial_decision | fta_decision | directive | guide | public_clarification | emaratax_manual | other
+  issue_date    date,
+  publish_date  date,
+  pages         int,
+  chars         int,
+  content_hash  text not null,                  -- sha256 of the PDF; unchanged files are skipped
+  active        boolean not null default true,  -- false = hidden from search
+  fetched_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
+);
+
+create table if not exists library_chunks (
+  id           serial primary key,
+  document_id  int not null references library_documents(id) on delete cascade,
+  seq          int not null,
+  title        text not null default '',        -- copy of the document title (weighted in search)
+  heading      text not null default '',        -- e.g. "Article (26) Date of Supply in Special Cases"
+  page_from    int,
+  page_to      int,
+  text         text not null,
+  tsv          tsvector generated always as (
+                 setweight(to_tsvector('english', coalesce(title, '')), 'A') ||
+                 setweight(to_tsvector('english', coalesce(heading, '')), 'A') ||
+                 setweight(to_tsvector('english', text), 'C')
+               ) stored,
+  unique (document_id, seq)
+);
+
+create index if not exists library_chunks_tsv_idx on library_chunks using gin (tsv);
+create index if not exists library_chunks_doc_idx on library_chunks (document_id);
+
+-- ============================================================================
+-- Newell Assistant self-update (assistant_updater.py; every 14 days or "Check
+-- now" on /assistant-knowledge). Created by execution/migrate_assistant_updates.py.
+-- ============================================================================
+alter table library_documents add column if not exists file_size bigint;      -- from HEAD: spot a changed PDF without downloading
+alter table library_documents add column if not exists etag text;
+alter table library_documents add column if not exists last_modified text;
+alter table library_documents add column if not exists reviewed_at timestamptz; -- NULL = in the review queue (new/changed, not yet read against the knowledge base)
+alter table assistant_knowledge add column if not exists updated_by text not null default 'office';  -- office | assistant
+
+create table if not exists assistant_update_runs (
+  id           serial primary key,
+  trigger      text not null default 'schedule',   -- schedule | manual
+  status       text not null default 'running',    -- running | done | failed
+  started_at   timestamptz not null default now(),
+  finished_at  timestamptz,
+  summary      jsonb not null default '{}'::jsonb, -- new / changed / removed documents, counts, notes
+  error        text
+);
+
+create table if not exists assistant_knowledge_changes (
+  id            serial primary key,
+  run_id        int references assistant_update_runs(id) on delete set null,
+  entry_id      int,                                -- assistant_knowledge.id
+  action        text not null,                      -- create | update | verify
+  before        jsonb,                              -- {topic, title, body, sources, lastVerified}
+  after         jsonb,
+  reason        text not null default '',
+  source_title  text not null default '',
+  source_url    text not null default '',
+  quote         text not null default '',           -- verbatim text from the source (checked in code)
+  created_at    timestamptz not null default now(),
+  undone_at     timestamptz                         -- set by Undo on /assistant-knowledge
+);
+
+create index if not exists assistant_knowledge_changes_created_idx on assistant_knowledge_changes (created_at desc);
+create index if not exists assistant_update_runs_started_idx on assistant_update_runs (started_at desc);
